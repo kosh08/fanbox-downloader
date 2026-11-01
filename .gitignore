@@ -1,0 +1,12 @@
+dist/
+__pycache__/
+*.pyc
+node_modules/
+.env
+.env.*
+credentials*.json
+*client_secret*.json
+*service-account*.json
+settings.json
+downloads/
+.fanbox-state/

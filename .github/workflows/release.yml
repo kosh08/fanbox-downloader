@@ -1,0 +1,50 @@
+name: Release and submit Chrome update
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: chrome-store-release
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - run: node --test extension/tests/core.test.mjs
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Build the version matching the release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
+        run: python3 scripts/build.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: extension-package
+          path: dist/*.zip
+      - name: Attach ZIP to GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/*.zip dist/*.sha256
+      - name: Submit update to the Chrome Web Store
+        if: vars.CWS_AUTO_PUBLISH == 'true' && github.event_name == 'release'
+        env:
+          CWS_PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }}
+          CWS_EXTENSION_ID: ${{ vars.CWS_EXTENSION_ID }}
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+        run: python3 scripts/publish.py --submit
+      - name: Explain when automatic submission is disabled
+        if: vars.CWS_AUTO_PUBLISH != 'true' || github.event_name != 'release'
+        run: echo 'Package created. Store submission is not enabled. Follow docs/初回設定.md to activate it.'

@@ -1,0 +1,26 @@
+name: Check extension
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Test downloader and ZIP extraction
+        run: node --test extension/tests/core.test.mjs
+      - name: Test release automation
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Build and validate store package
+        run: python3 scripts/build.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: extension-package
+          path: dist/*.zip
