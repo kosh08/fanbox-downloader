@@ -5,5 +5,5 @@
 - Increment the manifest version for a release, and update the visible version in app.html. Update version-sensitive release tests if needed.
 - Run node --test extension/tests/*.test.mjs and python -m unittest discover -s scripts -p 'test_*.py' -v.
 - The updater checks an exact asset allowlist. New runtime files require updates to scripts/build.py FILES and extension/update.mjs PATHS. Do not include update.json in its own hash index.
-- Never store GitHub tokens or FANBOX session information in source, logs, release ZIPs, or chat. Preserve private repository visibility.
+- Never store GitHub tokens or FANBOX session information in source, logs, release ZIPs, or chat. The user authorized publishing this source repository; do not publish downloaded works or account data.
 - Repository updates are not proof of successful FANBOX downloads. State live-account verification limits.

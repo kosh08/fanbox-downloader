@@ -74,12 +74,23 @@ export function collectAssets(post) {
   }
   if (body.html && typeof DOMParser !== 'undefined') {
     const doc = new DOMParser().parseFromString(body.html, 'text/html');
-    for (const element of doc.querySelectorAll('[data-src-original],a[href]')) {
-      const url = element.getAttribute('data-src-original') || element.getAttribute('href');
-      if (element.hasAttribute('data-src-original') || /downloads\.fanbox\.cc\/|fanbox\.pixiv\.net\/images\/entry/.test(url)) add({url}, 'url');
+    for (const element of doc.querySelectorAll('[data-src-original],a[href],video[src],audio[src],source[src]')) {
+      const source = element.getAttribute('data-src-original') || element.getAttribute('href') || element.getAttribute('src');
+      let url;try{url=new URL(source,'https://www.fanbox.cc/').href;}catch{continue;}
+      if (element.matches('video,audio,source')) {
+        try{checkedURL(url);}catch{continue;}
+        add({url},'url');
+      } else if (element.hasAttribute('data-src-original') || /downloads\.fanbox\.cc\/|fanbox\.pixiv\.net\/images\/entry/.test(url)) add({url}, 'url');
     }
   }
   return assets;
+}
+
+export function assetKind(ext) {
+  if(['mp4','webm','mov','m4v','avi','mkv','mpeg','mpg'].includes(ext))return '動画';
+  if(['mp3','m4a','wav','ogg','oga','opus','flac','aac','aiff','wma'].includes(ext))return '音声';
+  if(['jpg','jpeg','png','gif','webp','avif','bmp','tif','tiff'].includes(ext))return '画像';
+  return '添付ファイル';
 }
 
 export function postText(rule, post) {
@@ -89,7 +100,10 @@ export function postText(rule, post) {
     if (block.text) lines.push(block.text);
     for (const link of block.links || []) lines.push(link.url || '');
   }
-  if (body.html && typeof DOMParser !== 'undefined') lines.push(new DOMParser().parseFromString(body.html, 'text/html').body.textContent);
+  if (body.html && typeof DOMParser !== 'undefined') {
+    const doc=new DOMParser().parseFromString(body.html,'text/html');lines.push(doc.body.textContent);
+    for(const el of doc.querySelectorAll('a[href],video[src],audio[src],source[src]'))lines.push(el.getAttribute('href')||el.getAttribute('src'));
+  }
   const embeds = Object.fromEntries(['video', 'embedMap', 'urlEmbedMap'].filter(k => body[k]).map(k => [k, body[k]]));
   if (Object.keys(embeds).length) lines.push('外部埋め込み（自動取得対象外）', JSON.stringify(embeds, null, 2));
   return '\ufeff' + lines.join('\n');
@@ -290,7 +304,7 @@ export class Downloader {
     for (const asset of targets) {
       checkStop(this.signal);
       const {prefix,parts}=asset;
-      this.log(`保存中：${parts.at(-1)}`);
+      this.log(`${assetKind(asset.ext)}を保存中：${parts.at(-1)}`);
       const response = await this.client.response(asset.url);
       if (/text\/html/i.test(response.headers.get('Content-Type') || '')) { await response.body?.cancel(); throw new AppError('ファイルの代わりにログイン画面が返されました。'); }
       records.push(await this.disk.write(parts, response.body, this.signal));

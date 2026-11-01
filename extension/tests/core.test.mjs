@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
-import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody} from '../core.mjs';
+import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind} from '../core.mjs';
 const require = createRequire(import.meta.url);
 globalThis.zip = require('../vendor/zip-native.min.js');
 zip.configure({useWebWorkers: false});
@@ -179,4 +179,15 @@ test('matching files without management metadata also prompt',async()=>{
 test('cancel at an existing post stops the batch without downloading',async()=>{
   const c=fakeClient([post('1'),post('2')]),disk=new Disk(new MemoryDirectory());await new Downloader(c,disk).run([rule()]);
   await assert.rejects(()=>new Downloader(c,disk,()=>{},{onExisting:async()=>({action:'cancel'})}).run([rule()]),{name:'AbortError'});assert.equal(c.downloads,2);
+});
+test('direct video and audio attachments save their original bytes and title',async()=>{
+  const p=post('media',{title:'動画と音声',body:{files:[{url:'https://downloads.fanbox.cc/movie.mp4',extension:'mp4',name:'movie.mp4'},{url:'https://downloads.fanbox.cc/voice.mp3',extension:'mp3',name:'voice.mp3'}]}});
+  const bytes=new Uint8Array([0,255,1,2,3,4]),client=fakeClient([p],new Blob([bytes])),disk=new Disk(new MemoryDirectory()),logs=[];
+  assert.equal((await new Downloader(client,disk,text=>logs.push(text)).run([rule()])).saved,1);
+  const base=baseName(rule(),p);
+  for(const[name,index]of [['movie.mp4','001'],['voice.mp3','002']]){
+    const f=await disk.file(['作家__sample',base,`${base}_${index}_${name}`]);assert.deepEqual(new Uint8Array(await f.arrayBuffer()),bytes);
+  }
+  assert(logs.some(s=>s.startsWith('動画を保存中')));assert(logs.some(s=>s.startsWith('音声を保存中')));
+  assert.equal(assetKind('wav'),'音声');assert.equal(assetKind('webm'),'動画');
 });

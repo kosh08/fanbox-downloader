@@ -197,18 +197,25 @@ function askExisting({rule,item,namingChanged}) {
 $('preview').addEventListener('click', () => start(true).catch(showError));
 $('download').addEventListener('click', () => start(false).catch(showError));
 $('stop').addEventListener('click', () => controller?.abort());
-$('update-folder').addEventListener('click',async()=>{
+function showUpdateSetup() {
+  $('update-folder-name').textContent=updateHandle?updateHandle.name:'未設定';
+  $('update-config').open=!updateHandle;
+  $('update-ready-note').textContent=updateHandle?'更新先は設定済みです。「最新版に更新」を押すだけで確認・適用します。':'初回だけ更新先を設定します。次回からはこのボタンだけで更新できます。';
+}
+async function chooseUpdateFolder(){
   try {
     const handle=await showDirectoryPicker({id:'fanbox-extension-update',mode:'readwrite'});
     await validateFolder(handle,chrome.runtime.getManifest());
-    updateHandle=handle;await storeHandle(handle,'update-folder');$('update-folder-name').textContent=handle.name;
-    $('update-status').textContent='更新先を設定しました。次回から更新ZIPを選ぶだけで適用できます。';
-  }catch(e){if(e.name!=='AbortError')showError(e);}
-});
+    updateHandle=handle;await storeHandle(handle,'update-folder');showUpdateSetup();
+    $('update-status').textContent='設定できました。次回から「最新版に更新」だけで更新できます。';
+    return true;
+  }catch(e){if(e.name!=='AbortError')showError(e);return false;}
+}
+$('update-folder').addEventListener('click',()=>chooseUpdateFolder());
 
 async function updateTool(source) {
   if(busy)return;
-  if(!updateHandle){log('先に「拡張機能のフォルダを選ぶ」で更新先を設定してください。');return;}
+  if(!updateHandle){if(!await chooseUpdateFolder())return;if(source==='zip')return;}
   let file;
   try {
     if(await updateHandle.requestPermission({mode:'readwrite'})!=='granted')throw new AppError('更新先の読み書きを許可してください。');
@@ -223,8 +230,7 @@ async function updateTool(source) {
       if(!lock)throw new AppError('別の管理画面で作品を保存しています。完了後に更新してください。');
       $('update-status').textContent='更新ファイルを確認中…';
       const current=chrome.runtime.getManifest();
-      const pack=source==='zip'?await zipPackage(file,current):await githubPackage(current,$('github-token').value);
-      $('github-token').value='';
+      const pack=source==='zip'?await zipPackage(file,current):await githubPackage(current);
       if(pack.upToDate){$('update-status').textContent='現在のバージョンが最新です。';return;}
       $('update-status').textContent=`v${pack.index.version} を適用中… タブを閉じないでください。`;
       await applyPackage(updateHandle,pack,current,async expected=>{
@@ -237,7 +243,7 @@ async function updateTool(source) {
       $('update-status').textContent='更新しました。画面が閉じたら、拡張機能のボタンから開き直してください。';
       await chrome.runtime.sendMessage({type:'fanbox-reload-after-update'});
     });
-  }catch(e){$('github-token').value='';$('update-status').textContent=userError(e);log(userError(e));}
+  }catch(e){$('update-status').textContent=userError(e);log(userError(e));}
   finally{state(false);}
 }
 $('update-zip').addEventListener('click',()=>updateTool('zip').catch(showError));
@@ -250,7 +256,7 @@ async function init() {
     storedRules = (await chrome.storage.local.get('rules')).rules || {};
     rootHandle = await loadHandle(); await folderStatus();
     updateHandle=await loadHandle('update-folder');
-    if(updateHandle)$('update-folder-name').textContent=updateHandle.name;
+    showUpdateSetup();
     $('installed-version').textContent='v'+chrome.runtime.getManifest().version;
     if (!window.showDirectoryPicker) throw new AppError('このChromeでは保存先の選択を利用できません。パソコン版Chromeを更新してください。');
   } catch (e) { showError(e); }

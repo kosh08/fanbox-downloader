@@ -43,7 +43,7 @@ export async function githubPackage(current, token='', fetcher=globalThis.fetch.
     let r;
     try { r=await fetcher(`https://api.github.com/repos/${REPOSITORY}/${path}`,{headers,credentials:'omit',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(30000)}); }
     catch { throw new AppError('GitHubに接続できませんでした。'); }
-    if(!r.ok) {await r.body?.cancel();throw new AppError(r.status===404||r.status===401?'非公開リポジトリには読み取り専用トークンが必要です。GitHubから取得したZIPを選ぶ方法も使えます。':`GitHubへの接続に失敗しました（HTTP ${r.status}）。`);}
+    if(!r.ok) {await r.body?.cancel();throw new AppError(r.status===404||r.status===401?'更新元を開けません。非公開のままになっていないかGitHubの公開設定を確認してください。ZIPからの更新も使えます。':`GitHubへの接続に失敗しました（HTTP ${r.status}）。`);}
     return r.json();
   };
   // Every file is pinned to one commit, even if main changes during the update.
