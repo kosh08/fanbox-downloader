@@ -1,7 +1,8 @@
 import {AppError, Client, Disk, Downloader, userError} from './core.mjs';
+import {githubPackage, zipPackage, applyPackage, validateFolder, sha256} from './update.mjs';
 
 const $ = id => document.getElementById(id);
-let rules = [], storedRules = {}, rootHandle = null, busy = false, controller;
+let rules = [], storedRules = {}, rootHandle = null, updateHandle = null, busy = false, controller;
 const RULE_ID = 73001;
 const showError = e => log(userError(e));
 
@@ -88,22 +89,22 @@ function database() {
   });
 }
 
-async function storeHandle(handle) {
+async function storeHandle(handle,key='folder') {
   const db = await database();
   try {
     await new Promise((resolve, reject) => {
       const tx = db.transaction('settings', 'readwrite');
-      tx.objectStore('settings').put(handle, 'folder');
+      tx.objectStore('settings').put(handle, key);
       tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
     });
   } finally { db.close(); }
 }
 
-async function loadHandle() {
+async function loadHandle(key='folder') {
   const db = await database();
   try {
     return await new Promise((resolve, reject) => {
-      const request = db.transaction('settings').objectStore('settings').get('folder');
+      const request = db.transaction('settings').objectStore('settings').get(key);
       request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
     });
   } finally { db.close(); }
@@ -171,6 +172,51 @@ async function start(preview) {
 $('preview').addEventListener('click', () => start(true).catch(showError));
 $('download').addEventListener('click', () => start(false).catch(showError));
 $('stop').addEventListener('click', () => controller?.abort());
+$('update-folder').addEventListener('click',async()=>{
+  try {
+    const handle=await showDirectoryPicker({id:'fanbox-extension-update',mode:'readwrite'});
+    await validateFolder(handle,chrome.runtime.getManifest());
+    updateHandle=handle;await storeHandle(handle,'update-folder');$('update-folder-name').textContent=handle.name;
+    $('update-status').textContent='更新先を設定しました。次回から更新ZIPを選ぶだけで適用できます。';
+  }catch(e){if(e.name!=='AbortError')showError(e);}
+});
+
+async function updateTool(source) {
+  if(busy)return;
+  if(!updateHandle){log('先に「拡張機能のフォルダを選ぶ」で更新先を設定してください。');return;}
+  let file;
+  try {
+    if(await updateHandle.requestPermission({mode:'readwrite'})!=='granted')throw new AppError('更新先の読み書きを許可してください。');
+    if(source==='zip') {
+      const [handle]=await showOpenFilePicker({types:[{description:'更新ZIP',accept:{'application/zip':['.zip']}}],multiple:false});
+      file=await handle.getFile();
+    }
+  }catch(e){if(e.name!=='AbortError')showError(e);return;}
+  state(true);$('stop').disabled=true;
+  try {
+    await navigator.locks.request('fanbox-archive-run',{ifAvailable:true},async lock=>{
+      if(!lock)throw new AppError('別の管理画面で作品を保存しています。完了後に更新してください。');
+      $('update-status').textContent='更新ファイルを確認中…';
+      const current=chrome.runtime.getManifest();
+      const pack=source==='zip'?await zipPackage(file,current):await githubPackage(current,$('github-token').value);
+      $('github-token').value='';
+      if(pack.upToDate){$('update-status').textContent='現在のバージョンが最新です。';return;}
+      $('update-status').textContent=`v${pack.index.version} を適用中… タブを閉じないでください。`;
+      await applyPackage(updateHandle,pack,current,async expected=>{
+        // Reject a different copy of the extension folder before reloading Chrome.
+        const live=await fetch(chrome.runtime.getURL('manifest.json')+'?check='+Date.now(),{cache:'no-store'});
+        const bytes=new Uint8Array(await live.arrayBuffer());
+        const target=expected.index.files.find(f=>f.path==='manifest.json');
+        if(await sha256(bytes)!==target.sha256)throw new AppError('実際に読み込んでいるフォルダと違います。');
+      });
+      $('update-status').textContent='更新しました。画面が閉じたら、拡張機能のボタンから開き直してください。';
+      await chrome.runtime.sendMessage({type:'fanbox-reload-after-update'});
+    });
+  }catch(e){$('github-token').value='';$('update-status').textContent=userError(e);log(userError(e));}
+  finally{state(false);}
+}
+$('update-zip').addEventListener('click',()=>updateTool('zip').catch(showError));
+$('update-github').addEventListener('click',()=>updateTool('github').catch(showError));
 window.addEventListener('beforeunload', event => { if (busy) { event.preventDefault(); event.returnValue = ''; } });
 
 async function init() {
@@ -178,6 +224,9 @@ async function init() {
   try {
     storedRules = (await chrome.storage.local.get('rules')).rules || {};
     rootHandle = await loadHandle(); await folderStatus();
+    updateHandle=await loadHandle('update-folder');
+    if(updateHandle)$('update-folder-name').textContent=updateHandle.name;
+    $('installed-version').textContent='v'+chrome.runtime.getManifest().version;
     if (!window.showDirectoryPicker) throw new AppError('このChromeでは保存先の選択を利用できません。パソコン版Chromeを更新してください。');
   } catch (e) { showError(e); }
   finally { state(false); }

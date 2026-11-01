@@ -1,50 +1,38 @@
-# FANBOX まとめて保存 — 自動配布用リポジトリ
+# FANBOX まとめて保存 — 無料更新版
 
-FANBOX拡張機能のソース・テスト・配布の仕組みをまとめた一式です。
+Chromeウェブストアの登録・料金は不要です。現在はGitHubまたは更新ZIPから、管理画面で更新する方式です。ストアへの自動申請は停止しています。
 
-**現在は配布準備まで完了しています。GitHubリポジトリとChromeウェブストアへの登録・認証設定は未実施です。自動更新はまだ稼働していません。**
+## 使い始める
 
-## 初期設定後の流れ
+[初回設定と更新方法](docs/初回設定.md)を確認してください。v1.0.xからの最初の切り替えだけは、ファイルの上書きとChromeの拡張機能再読み込みが必要です。その後は画面の「ツールの更新」から適用できます。
 
-1. 修正版のソースをGitHubに入れ、拡張機能のバージョン番号を上げる。
-2. GitHubの「Releases」から、同じ番号のタグ（例 `v1.0.2`）でリリースを公開する。
-3. GitHub Actionsがテストと配布ZIPの作成を実行し、ZIPをリリースに添付する。
-4. 設定が有効なら、Chromeウェブストアへ更新版をアップロードして審査申請する。
-5. 審査通過後、**ストア版をインストールしたChrome**へChrome標準の仕組みで更新が配信される。
+## 更新方法
 
-更新は即時ではなく、審査やChromeの更新確認による待ち時間があります。更新が不要なときはGitHubリリースを作らず、コードだけ変更できます。
+- **ZIPから更新**：GitHub Releasesの更新ZIP、またはGitHubの「Code → Download ZIP」を保存し、管理画面の「更新ZIPを選んで適用」を押します。
+- **GitHubから直接更新**：固定のリポジトリ kosh08/fanbox-downloader のmainから取得します。非公開リポジトリには、そのリポジトリのContents読み取り専用トークンを画面に入力します。入力値は保存しません。
+- 初回だけ、作品の保存先とは別に、実際にChromeへ読み込んでいる拡張機能フォルダへの書き込みを許可します。
+- 管理画面での明示操作による更新です。無人での自動更新は行いません。
+- 更新ファイルのハッシュ・サイズ・権限を確認し、旧ファイルをバックアップして適用します。処理中のエラーは元に戻します。更新中のChrome終了・PC停止に対する完全な一括書き込み保証はありません。
+- 書き換え後、読み込んでいるフォルダと一致することを確認し、拡張機能と管理画面を再読み込みします。設定・作品の保存先は維持します。
 
-## 最初に読むもの
+## 開発とリリース
 
-- [初回設定の手順](docs/初回設定.md)
-- [ストア掲載文と権限の説明](docs/ストア掲載文.md)
-- [プライバシー説明](docs/プライバシー.md)
-- [拡張機能の使い方](extension/使い方.md)
-
-`extension/` が拡張機能です。`dist/` に作られるZIPは、Chromeウェブストアへのアップロード用で、ZIPの一番上に `manifest.json` が入ります。
-
-## 動作確認
-
-Node.js 24以上とPython 3.10以上で、追加パッケージなしで実行できます。
+1. ソースを修正し、extension/manifest.json のversionを上げます。画面の版表示も合わせます。
+2. 以下のテストとビルドを行います。ビルドで生成される extension/update.json もコミットします。
+3. GitHubで同じバージョンのリリース（例 v1.1.0）を公開すると、Actionsがテスト・更新ZIP生成・リリースへの添付を実行します。
 
 ```text
-node --test extension/tests/core.test.mjs
+node --test extension/tests/*.test.mjs
 python -m unittest discover -s scripts -p "test_*.py" -v
 python scripts/build.py
-python scripts/publish.py
 ```
 
-最後のコマンドは通信を行わない確認モードです。ストア申請は `--submit` を付け、必要な認証設定を用意した場合だけ実行します。
+Node.js 24以上、Python 3.10以上。追加パッケージ不要です。dist/ のZIPはmanifest.jsonが最上位にある更新用パッケージです。
 
-## 配布の制約
+GitHubへの追加接続権限を含むv1.1.0を最初に手動導入してください。以降も権限が変わる版は画面内で自動適用せず、手動導入を案内します。非公開リポジトリは非公開のまま保持します。
 
-Windows版Chromeの通常利用では、GitHub ReleasesにZIPを置いただけでは拡張機能の自動更新は有効になりません。本構成はChromeウェブストアでの配信を使います。現在の「パッケージ化されていない拡張機能」は自動でストア版に変わらないため、**初回だけストア版へのインストール切り替えが必要**です。設定や保存先の許可も再設定が必要になる場合があります。
+## 確認範囲
 
-本拡張機能はFANBOX公式製品ではありません。実アカウントの支援投稿の取得、ストアでの審査・公開、GitHub Actionsのクラウド上の実行は未検証です。ローカルの自動テストとZIP検証を行っています。
+合成データでの投稿保存・ZIP展開、新旧FANBOX API形式、更新ZIPの読み取り・整合性確認・適用・ロールバックをテストしています。実アカウントのFANBOX投稿の取得は未検証です。GitHub Actionsは実行結果を確認してください。
 
-## 公式資料
-
-- [Chromeの配信方法の制約](https://developer.chrome.com/docs/extensions/how-to/distribute/host-on-linux)
-- [ChromeウェブストアAPIの初期設定](https://developer.chrome.com/docs/webstore/using-api)
-- [アップロードAPI](https://developer.chrome.com/docs/webstore/api/reference/rest/v2/media/upload)
-- [審査申請API](https://developer.chrome.com/docs/webstore/api/reference/rest/v2/publishers.items/publish)
+scripts/publish.py とストア掲載関連文書は以前のストア案の資料として残しています。現在のワークフローから呼び出すことはありません。

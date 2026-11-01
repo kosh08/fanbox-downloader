@@ -9,7 +9,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 FILES = ('manifest.json', 'app.html', 'app.mjs', 'background.js', 'core.mjs', 'style.css',
          'vendor/zip-native.min.js', 'vendor/zip.js-LICENSE.txt',
-         'icons/16.png', 'icons/48.png', 'icons/128.png')
+         'icons/16.png', 'icons/48.png', 'icons/128.png', 'update.mjs', 'update.json')
 
 
 def validate_manifest(manifest):
@@ -20,7 +20,7 @@ def validate_manifest(manifest):
         raise ValueError('Manifest V3 is required')
     if set(manifest.get('permissions', [])) != {'storage', 'declarativeNetRequestWithHostAccess'}:
         raise ValueError('Review changed extension permissions before releasing')
-    if set(manifest.get('host_permissions', [])) != {'https://*.fanbox.cc/*', 'https://*.pximg.net/*', 'https://fanbox.pixiv.net/*'}:
+    if set(manifest.get('host_permissions', [])) != {'https://*.fanbox.cc/*', 'https://*.pximg.net/*', 'https://fanbox.pixiv.net/*', 'https://api.github.com/*'}:
         raise ValueError('Review changed host permissions before releasing')
     if 'update_url' in manifest:
         raise ValueError('Chrome Web Store manages the update URL; do not set a GitHub update_url')
@@ -33,6 +33,10 @@ def build(root=ROOT, tag=None):
     version = validate_manifest(manifest)
     if tag and tag != 'v' + version:
         raise ValueError('Release tag must match manifest version: v' + version)
+    index = {'application': 'fanbox-downloader', 'version': version, 'files': [
+        {'path': name, 'size': (source / name).stat().st_size, 'sha256': hashlib.sha256((source / name).read_bytes()).hexdigest()}
+        for name in FILES if name != 'update.json']}
+    (source / 'update.json').write_text(json.dumps(index, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     dest = Path(root) / 'dist'
     dest.mkdir(exist_ok=True)
     archive = dest / ('FANBOX-Chrome-v' + version + '.zip')

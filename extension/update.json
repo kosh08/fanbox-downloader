@@ -1,0 +1,66 @@
+{
+  "application": "fanbox-downloader",
+  "version": "1.1.0",
+  "files": [
+    {
+      "path": "manifest.json",
+      "size": 1089,
+      "sha256": "bc4eaf2d560f5143c1afeeae3e7e8a94df675a0bed02e782939dcf9902c4a030"
+    },
+    {
+      "path": "app.html",
+      "size": 4772,
+      "sha256": "c2c7042fcf255dbeba59e9f13b047a29526284106db72fba244c6267c0612725"
+    },
+    {
+      "path": "app.mjs",
+      "size": 12181,
+      "sha256": "4e2890663b6a5fe95d3e446121ce0c2bc54df9d97cf2229cd588dd86f872e7f0"
+    },
+    {
+      "path": "background.js",
+      "size": 692,
+      "sha256": "b574af5ab086a446892d4a9d4eb66d36e97453f6225d48bd2248afad9b3906e4"
+    },
+    {
+      "path": "core.mjs",
+      "size": 18223,
+      "sha256": "a5e7400578a5a056344c50db778306ab859d6484486c8469cd346b49d4c6bcee"
+    },
+    {
+      "path": "style.css",
+      "size": 4361,
+      "sha256": "455f0acc63c04d9fdc5da467a8ea9e78944231c3c227434bc986d684fca2f2d1"
+    },
+    {
+      "path": "vendor/zip-native.min.js",
+      "size": 173661,
+      "sha256": "0e6e3b1a5c7a55bf80c24c745a2f2ca2e0b7d34272e1231f23e07e1174356111"
+    },
+    {
+      "path": "vendor/zip.js-LICENSE.txt",
+      "size": 1501,
+      "sha256": "1b7ebc8d7889ed25491484ab2b102370742ca6c0b26650a0c62cc2269b579b84"
+    },
+    {
+      "path": "icons/16.png",
+      "size": 668,
+      "sha256": "4d79af660262e4b393bd121ad3eb02292dcb00af9836a82b85a8288105e62707"
+    },
+    {
+      "path": "icons/48.png",
+      "size": 1782,
+      "sha256": "25129859bb309e2fa8cc7c9c1abb830ec1763a292b79f9c0a4e93d5fba4e9d9c"
+    },
+    {
+      "path": "icons/128.png",
+      "size": 4508,
+      "sha256": "2b757ee51450120a5c7ac2bbc95d3ba3f260af7c9f9f5d344dde85b90a1fa34b"
+    },
+    {
+      "path": "update.mjs",
+      "size": 8647,
+      "sha256": "950fcfc6d2f3da8820db2c1a94f658bc48f965fee23e71210bdef534e742dfd2"
+    }
+  ]
+}

@@ -14,7 +14,7 @@ class ReleaseTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         shutil.copytree(ROOT / 'extension', self.root / 'extension')
-        self.package = build(self.root, 'v1.0.1')
+        self.package = build(self.root, 'v1.1.0')
         self.config = {key: 'private-test-value' for key in ('CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN')}
         self.config.update(CWS_PUBLISHER_ID='publisher-1', CWS_EXTENSION_ID='a' * 32)
 
@@ -25,7 +25,7 @@ class ReleaseTests(unittest.TestCase):
         (self.root / 'extension/credentials.json').write_text('private', encoding='utf-8')
         with zipfile.ZipFile(build(self.root)) as z:
             self.assertEqual(set(z.namelist()), set(FILES))
-            self.assertEqual(json.loads(z.read('manifest.json'))['version'], '1.0.1')
+            self.assertEqual(json.loads(z.read('manifest.json'))['version'], '1.1.0')
             self.assertNotIn('credentials.json', z.namelist())
 
     def test_reproducible_build(self):

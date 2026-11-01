@@ -10,3 +10,4 @@ credentials*.json
 settings.json
 downloads/
 .fanbox-state/
+.fanbox-update-backup/

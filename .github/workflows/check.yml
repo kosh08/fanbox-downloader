@@ -15,7 +15,7 @@ jobs:
         with:
           node-version: '24'
       - name: Test downloader and ZIP extraction
-        run: node --test extension/tests/core.test.mjs
+        run: node --test extension/tests/*.test.mjs
       - name: Test release automation
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Build and validate store package
