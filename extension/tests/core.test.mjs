@@ -69,8 +69,8 @@ test('fee max, exact, free inclusion and membership cap', () => {
   assert(!feeMatches(300, rule({mode: 'exact'}))); assert(feeMatches(500, rule({mode: 'exact'})));
 });
 test('naming is JST and same-day posts are distinct', () => {
-  assert.equal(baseName(rule(), post()), '作家_261101投稿分_p1');
-  assert.equal(baseName(rule(), post('1', {publishedDatetime: '2026-10-31T23:00:00Z'})), '作家_261101投稿分_p1');
+  assert.equal(baseName(rule(), post()), '作家_261101投稿分_無題_p1');
+  assert.equal(baseName(rule(), post('1', {publishedDatetime: '2026-10-31T23:00:00Z'})), '作家_261101投稿分_無題_p1');
   assert.notEqual(baseName(rule(), post()), baseName(rule(), post('2')));
   assert.equal(safeName('CON.txt'), '_CON.txt');
 });
@@ -97,13 +97,13 @@ test('401 has a readable authentication error', async () => {
 test('ZIP preflight rejects unsafe paths, symlinks, encryption, collisions and bombs', () => {
   const entry = extra => ({filename:'01.png',uncompressedSize:10,compressedSize:10,...extra});
   for (const e of [entry({filename:'../escape'}),entry({filename:'C:\\escape'}),entry({symlink:true}),entry({encrypted:true}),entry({uncompressedSize:999999})]) assert.throws(()=>zipPaths([e],'p',true));
-  assert.throws(()=>zipPaths([entry({filename:'a?.png'}),entry({filename:'a*.png'})],'p',true));
+  assert.equal(zipPaths([entry({filename:'a?.png'}),entry({filename:'a*.png'})],'p',true).length,2);
 });
 test('ZIP streams actual compressed data with Japanese filenames, grouped and flat', async () => {
   for (const grouped of [true,false]) {
     const disk = new Disk(new MemoryDirectory());
     await disk.write(['comic.zip'], await archive([['漫画/01.png','page1'],['漫画/02.png','page2']]));
-    const records = await unzip(disk,['comic.zip'],['creator'],'作家_261101投稿分_p1_001',grouped,new AbortController().signal);
+    const records = await unzip(disk,['comic.zip'],['creator'],'作家_261101投稿分_無題_p1_001',grouped,new AbortController().signal);
     assert.equal(records.length,2);
     assert.equal(await (await disk.file(records[0].parts)).text(),'page1');
     assert.equal(records[0].parts.length, grouped ? 4 : 2);
@@ -115,9 +115,9 @@ test('completed posts skip, missing files are downloaded again', async () => {
   assert.equal((await new Downloader(client,disk).run([rule()])).saved,1);
   assert.equal((await new Downloader(client,disk).run([rule()])).skipped,1);
   assert.equal(client.downloads,1);
-  const folder = root.dirs.get('作家__sample').dirs.get('作家_261101投稿分_p1');
-  folder.files.delete('作家_261101投稿分_p1_001.jpg');
-  assert.equal((await new Downloader(client,disk).run([rule()])).saved,1);
+  const folder = root.dirs.get('作家__sample').dirs.get('作家_261101投稿分_無題_p1');
+  folder.files.delete('作家_261101投稿分_無題_p1_001.jpg');
+  assert.equal((await new Downloader(client,disk,()=>{},{onExisting:async()=>({action:'redownload'})}).run([rule()])).saved,1);
   assert.equal(client.downloads,2);
 });
 test('ZIP attachments save and extract end to end then skip', async () => {
@@ -132,7 +132,7 @@ test('corrupt ZIP remains on disk and does not mark the post complete', async ()
   const result = await new Downloader(fakeClient([p],new Blob(['broken'])),disk).run([rule()]);
   assert.equal(result.errors,1); assert.equal(result.saved,0);
   assert.equal(await disk.json(['.fanbox-state','sample','1.json']),null);
-  assert.equal(await (await disk.file(['作家__sample','作家_261101投稿分_p1','作家_261101投稿分_p1_001.zip'])).text(),'broken');
+  assert.equal(await (await disk.file(['作家__sample','作家_261101投稿分_無題_p1','作家_261101投稿分_無題_p1_001.zip'])).text(),'broken');
 });
 test('restricted posts and higher-price posts are skipped', async () => {
   const c = fakeClient([post('1',{body:null}),post('2',{feeRequired:1000})]);
@@ -145,4 +145,38 @@ test('preview does not touch disk or download files', async () => {
 test('stop cancels the run', async () => {
   const c = fakeClient(), controller = new AbortController(); c.signal = controller.signal; controller.abort();
   await assert.rejects(()=>new Downloader(c,null).run([rule()]),{name:'AbortError'});
+});
+
+test('post titles are included in folder and image names and sanitized',async()=>{
+  const p=post('42',{title:'漫画/第1話: 完成版'}),root=new MemoryDirectory(),disk=new Disk(root),client=fakeClient([p]);
+  const base=baseName(rule(),p);
+  assert.equal(base,'作家_261101投稿分_漫画_第1話_ 完成版_p42');
+  assert.equal((await new Downloader(client,disk).run([rule()])).saved,1);
+  assert.equal(await(await disk.file(['作家__sample',base,base+'_001.jpg'])).text(),'image');
+  assert.equal([...safeName('😀'.repeat(49),48)].length,48);
+});
+test('existing posts prompt and support redownload with apply-all',async()=>{
+  const c=fakeClient([post('1'),post('2')]),disk=new Disk(new MemoryDirectory());
+  await new Downloader(c,disk).run([rule()]);let prompts=0;
+  const result=await new Downloader(c,disk,()=>{},{onExisting:async()=>{prompts++;return{action:'redownload',applyAll:true};}}).run([rule()]);
+  assert.equal(prompts,1);assert.equal(result.saved,2);assert.equal(c.downloads,4);
+});
+test('skip choices leave existing content untouched',async()=>{
+  const c=fakeClient(),disk=new Disk(new MemoryDirectory());await new Downloader(c,disk).run([rule()]);let prompts=0;
+  const result=await new Downloader(c,disk,()=>{},{onExisting:async()=>{prompts++;return{action:'skip'};}}).run([rule()]);
+  assert.equal(prompts,1);assert.equal(result.skipped,1);assert.equal(c.downloads,1);
+});
+test('older naming policy is still detected before downloading',async()=>{
+  const root=new MemoryDirectory(),disk=new Disk(root),c=fakeClient();await new Downloader(c,disk).run([rule()]);
+  const statePath=['.fanbox-state','sample','1.json'],state=await disk.json(statePath),policy=JSON.parse(state.policy);policy.version=1;state.policy=JSON.stringify(policy);await disk.write(statePath,JSON.stringify(state));let prompted=false;
+  const result=await new Downloader(c,disk,()=>{},{onExisting:async info=>{prompted=info.namingChanged;return{action:'skip'};}}).run([rule()]);
+  assert(prompted);assert.equal(result.skipped,1);assert.equal(c.downloads,1);
+});
+test('matching files without management metadata also prompt',async()=>{
+  const root=new MemoryDirectory(),disk=new Disk(root),c=fakeClient();await new Downloader(c,disk).run([rule()]);root.dirs.get('.fanbox-state').dirs.get('sample').files.delete('1.json');let prompts=0;
+  await new Downloader(c,disk,()=>{},{onExisting:async()=>{prompts++;return{action:'skip'};}}).run([rule()]);assert.equal(prompts,1);assert.equal(c.downloads,1);
+});
+test('cancel at an existing post stops the batch without downloading',async()=>{
+  const c=fakeClient([post('1'),post('2')]),disk=new Disk(new MemoryDirectory());await new Downloader(c,disk).run([rule()]);
+  await assert.rejects(()=>new Downloader(c,disk,()=>{},{onExisting:async()=>({action:'cancel'})}).run([rule()]),{name:'AbortError'});assert.equal(c.downloads,2);
 });

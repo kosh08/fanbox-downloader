@@ -164,8 +164,33 @@ async function start(preview) {
         const fee = active.get(rule.id).supportedFee;
         verified.push({...rule, supportedFee: fee, amount: Math.min(rule.amount, fee)});
       }
-      await new Downloader(client, preview ? null : new Disk(rootHandle), log).run(verified, preview);
+      await new Downloader(client, preview ? null : new Disk(rootHandle), log, {onExisting: askExisting}).run(verified, preview);
     });
+  });
+}
+
+function askExisting({rule,item,namingChanged}) {
+  const dialog=$('existing-dialog');
+  $('existing-post').textContent=`${rule.name} ／ ${item.title || '無題'}（投稿 ${item.id}）`;
+  $('existing-note').textContent=namingChanged ? '再ダウンロードするとタイトル付きの新しい名前で保存します。以前の名前のファイルは残ります。' : '再ダウンロードすると同じ保存名のファイルを上書きします。';
+  $('existing-all').checked=false;
+  for(const control of dialog.querySelectorAll('button,input'))control.disabled=false;
+  return new Promise(resolve=>{
+    let finished=false;
+    const finish=action=>{
+      if(finished)return;finished=true;
+      dialog.removeEventListener('click',click);dialog.removeEventListener('cancel',cancel);
+      controller.signal.removeEventListener('abort',abort);
+      const applyAll=$('existing-all').checked;
+      dialog.close();resolve({action,applyAll});
+    };
+    const click=e=>{const action=e.target.closest('[data-existing-action]')?.dataset.existingAction;if(action)finish(action);};
+    const cancel=e=>{e.preventDefault();finish('cancel');};
+    const abort=()=>finish('cancel');
+    dialog.addEventListener('click',click);dialog.addEventListener('cancel',cancel);
+    controller.signal.addEventListener('abort',abort,{once:true});
+    dialog.showModal();
+    if(controller.signal.aborted)abort();
   });
 }
 

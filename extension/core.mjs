@@ -27,7 +27,7 @@ export function unwrapBody(body, endpoint) {
 }
 
 export function safeName(value, limit = 64) {
-  let name = String(value).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().replace(/[. ]+$/g, '').slice(0, limit).replace(/[. ]+$/g, '') || '_';
+  let name = [...String(value).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().replace(/[. ]+$/g, '')].slice(0, limit).join('').replace(/[. ]+$/g, '') || '_';
   if (/^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\.|$)/i.test(name)) name = '_' + name;
   return name;
 }
@@ -51,7 +51,8 @@ export function baseName(rule, post) {
   if (Number.isNaN(date.getTime())) throw new AppError('投稿日時を読み取れません。');
   const parts = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Tokyo', year: '2-digit', month: '2-digit', day: '2-digit'}).formatToParts(date);
   const get = type => parts.find(p => p.type === type).value;
-  return `${safeName(rule.name, 40)}_${get('year')}${get('month')}${get('day')}投稿分_p${safeName(post.id, 24)}`;
+  const title = safeName(String(post.title || '無題').replace(/\s+/g, ' ').trim(), 48);
+  return `${safeName(rule.name, 40)}_${get('year')}${get('month')}${get('day')}投稿分_${title}_p${safeName(post.id, 24)}`;
 }
 
 export function collectAssets(post) {
@@ -191,6 +192,14 @@ export class Disk {
     }
     return true;
   }
+  async existsAny(records, signal) {
+    for (const r of records || []) {
+      checkStop(signal);
+      try { await this.file(r.parts); return true; }
+      catch(e) { if(e.name !== 'NotFoundError') throw e; }
+    }
+    return false;
+  }
   async json(parts) {
     try { return JSON.parse(await (await this.file(parts)).text()); }
     catch (e) { if (e.name === 'NotFoundError' || e instanceof SyntaxError) return null; throw e; }
@@ -210,7 +219,8 @@ export function zipPaths(entries, prefix, grouped) {
     size += entry.uncompressedSize;
     if (!Number.isSafeInteger(size) || size > 20 * 1024 ** 3 || entry.uncompressedSize > Math.max(entry.compressedSize, 1) * 1000) throw new AppError('ZIPの展開サイズ・圧縮率の上限を超えました。元ZIPを残します。');
     const cleaned = parts.map(p => safeName(p, 60));
-    const path = grouped ? [prefix + '_展開', ...cleaned] : [`${prefix}_z${String(index + 1).padStart(4, '0')}_${cleaned.at(-1)}`];
+    const leaf = `${prefix}_z${String(index + 1).padStart(4, '0')}_${cleaned.at(-1)}`;
+    const path = grouped ? [prefix + '_展開', ...cleaned.slice(0, -1), leaf] : [leaf];
     const key = path.join('/').toLowerCase();
     if (used.has(key)) throw new AppError('ZIP内の保存名が重複しています。元ZIPを残します。');
     used.add(key);
@@ -245,23 +255,41 @@ export function userError(e) {
 }
 
 export class Downloader {
-  constructor(client, disk, log = () => {}) { this.client = client; this.disk = disk; this.log = log; this.signal = client.signal; this.count = {saved: 0, skipped: 0, filtered: 0, restricted: 0, errors: 0}; }
+  constructor(client, disk, log = () => {}, options = {}) { this.client = client; this.disk = disk; this.log = log; this.signal = client.signal; this.onExisting = options.onExisting || (async () => ({action:'skip'})); this.existingAction = null; this.count = {saved: 0, skipped: 0, filtered: 0, restricted: 0, errors: 0}; }
+  async confirmExisting(rule, item, namingChanged) {
+    checkStop(this.signal);
+    const answer = this.existingAction ? {action:this.existingAction} : await this.onExisting({rule,item,namingChanged});
+    checkStop(this.signal);
+    if(answer?.action === 'cancel') throw new DOMException('保存を中止しました。', 'AbortError');
+    if(!['skip','redownload'].includes(answer?.action)) throw new AppError('保存済み投稿への選択を確認できません。');
+    if(answer.applyAll) this.existingAction = answer.action;
+    if(answer.action === 'skip') {this.count.skipped++;this.log(`保存済みをスキップ：${item.id}`);return false;}
+    return true;
+  }
   async save(rule, item) {
     const folder = `${safeName(rule.name, 40)}__${safeName(rule.id)}`;
     const statePath = ['.fanbox-state', safeName(rule.id), safeName(item.id) + '.json'];
-    const policy = JSON.stringify({grouped: rule.grouped, folder, version: 1});
+    const policy = JSON.stringify({grouped: rule.grouped, folder, version: 2});
     const old = await this.disk.json(statePath);
-    if (old?.policy === policy && old.updated === item.updatedDatetime && await this.disk.valid(old.files, this.signal)) { this.count.skipped++; this.log(`保存済み：${item.id}`); return; }
+    const existing = old?.files?.length && await this.disk.existsAny(old.files, this.signal);
+    if(existing && !await this.confirmExisting(rule,item,old.policy !== policy || old.base !== baseName(rule,item))) return;
     const post = await this.client.api('post.info?' + new URLSearchParams({postId: item.id}));
     if (post?.isRestricted || post?.body == null) { this.count.restricted++; this.log(`閲覧不可：${item.id}`); return; }
     if (!feeMatches(Number(post.feeRequired || 0), rule)) { this.count.filtered++; return; }
     const base = baseName(rule, post), destination = rule.grouped ? [folder, base] : [folder], records = [];
     const assets = collectAssets(post);
-    for (const [index, asset] of assets.entries()) {
-      checkStop(this.signal);
+    const targets = assets.map((asset,index) => {
       const prefix = `${base}_${String(index + 1).padStart(3, '0')}`;
       const original = asset.name ? '_' + safeName(asset.name.replace(/\.[^.]+$/, ''), 35) : '';
       const parts = [...destination, `${prefix}${original}.${asset.ext}`];
+      return {...asset,prefix,parts};
+    });
+    if(!existing && await this.disk.existsAny([...targets.map(a=>({parts:a.parts})),{parts:[...destination,`${base}_本文.txt`]}],this.signal)) {
+      if(!await this.confirmExisting(rule,post,false)) return;
+    }
+    for (const asset of targets) {
+      checkStop(this.signal);
+      const {prefix,parts}=asset;
       this.log(`保存中：${parts.at(-1)}`);
       const response = await this.client.response(asset.url);
       if (/text\/html/i.test(response.headers.get('Content-Type') || '')) { await response.body?.cancel(); throw new AppError('ファイルの代わりにログイン画面が返されました。'); }
@@ -273,11 +301,12 @@ export class Downloader {
       }
     }
     records.push(await this.disk.write([...destination, `${base}_本文.txt`], postText(rule, post), this.signal));
-    await this.disk.write(statePath, JSON.stringify({policy, updated: post.updatedDatetime ?? item.updatedDatetime, files: records}), this.signal);
+    await this.disk.write(statePath, JSON.stringify({policy, base, updated: post.updatedDatetime ?? item.updatedDatetime, files: records}), this.signal);
     this.count.saved++;
     this.log(`投稿保存完了：${base}`);
   }
   async run(rules, preview = false) {
+    this.existingAction=null;
     for (const rule of rules.filter(r => r.enabled)) {
       checkStop(this.signal);
       this.log(`支援先：${rule.name} ／ ${rule.supportedFee}円で支援`);
@@ -288,9 +317,9 @@ export class Downloader {
           if (item.isRestricted) { this.count.restricted++; continue; }
           if (preview) { this.count.saved++; this.log(`対象候補：${item.id} ／ ${item.title || ''} ／ ${item.feeRequired}円`); continue; }
           try { await this.save(rule, item); }
-          catch (error) { checkStop(this.signal); this.count.errors++; this.log(`投稿 ${item.id}：${userError(error)}`); }
+          catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`投稿 ${item.id}：${userError(error)}`); }
         }
-      } catch (error) { checkStop(this.signal); this.count.errors++; this.log(`${rule.name}：${userError(error)}`); }
+      } catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`${rule.name}：${userError(error)}`); }
     }
     const c = this.count;
     this.log(`終了：${preview ? '候補' : '保存'} ${c.saved} ／ 保存済み ${c.skipped} ／ 金額対象外 ${c.filtered} ／ 閲覧不可 ${c.restricted} ／ 失敗 ${c.errors}`);
