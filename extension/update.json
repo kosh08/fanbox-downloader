@@ -4,8 +4,8 @@
   "files": [
     {
       "path": "manifest.json",
-      "size": 1089,
-      "sha256": "bc4eaf2d560f5143c1afeeae3e7e8a94df675a0bed02e782939dcf9902c4a030"
+      "size": 1053,
+      "sha256": "1c20b6d4fa5308ae7bdcde663d20c46d8ae8827cf287b7e5c6ffa11a935f7365"
     },
     {
       "path": "app.html",

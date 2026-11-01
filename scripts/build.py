@@ -36,7 +36,7 @@ def build(root=ROOT, tag=None):
     index = {'application': 'fanbox-downloader', 'version': version, 'files': [
         {'path': name, 'size': (source / name).stat().st_size, 'sha256': hashlib.sha256((source / name).read_bytes()).hexdigest()}
         for name in FILES if name != 'update.json']}
-    (source / 'update.json').write_text(json.dumps(index, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    (source / 'update.json').write_bytes((json.dumps(index, ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
     dest = Path(root) / 'dist'
     dest.mkdir(exist_ok=True)
     archive = dest / ('FANBOX-Chrome-v' + version + '.zip')
