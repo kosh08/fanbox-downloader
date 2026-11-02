@@ -1,16 +1,16 @@
 {
   "application": "fanbox-downloader",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "files": [
     {
       "path": "manifest.json",
       "size": 1053,
-      "sha256": "2a70fdf3454ca0a815f8d22122063aeb1d28bd7155f0efb90d5b8d2fadb2322b"
+      "sha256": "48212326cce54b844858b8dcd3e4d99992770f3d43f246ca4f3e32a362d3122a"
     },
     {
       "path": "app.html",
       "size": 6416,
-      "sha256": "4bc2d975ff19c628c2a0b0681a4a31a8ec74e8e5d3256716d55de43c0781919f"
+      "sha256": "58d1ee6dd641d991b3d9ad8a9213da35d78282ebb22e592ff5eaab1adc1de2a2"
     },
     {
       "path": "app.mjs",
@@ -24,8 +24,8 @@
     },
     {
       "path": "core.mjs",
-      "size": 24292,
-      "sha256": "cae3c8a69721d4b26e6b2cfdaa58caa037e555be399a3c9878ad42b22860966e"
+      "size": 29074,
+      "sha256": "48b69339ff48041e2569c9db9692dc3dd8e78614a7f550c965132b2a0ce24978"
     },
     {
       "path": "style.css",

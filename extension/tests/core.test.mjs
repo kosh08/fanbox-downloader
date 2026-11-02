@@ -283,3 +283,50 @@ test('supported and manual creators merge without duplicates and preserve settin
   assert.equal(rules.length,2);assert.equal(rules[0].name,'Current name');assert.equal(rules[0].amount,300);assert.equal(rules[0].grouped,false);assert.equal(rules[0].manual,true);assert.equal(rules[0].mode,'exact');
   assert.equal(rules[1].supportedFee,0);assert.equal(rules[1].includeFree,true);
 });
+
+
+test('ZIP write refusal identifies its file and reuses the verified original ZIP on retry',async()=>{
+  const root=new MemoryDirectory(),disk=new Disk(root),p=post('7',{body:{files:[{url:'https://downloads.fanbox.cc/application.zip?token=private',extension:'zip'}]}});
+  const c=fakeClient([p],await archive([['data.bundle','data'],['Runtime/plugin.dll','library']])),logs=[];
+  let blocked=true;const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(blocked&&create&&parts.at(-1).endsWith('.dll'))throw new TypeError('untrusted message https://secret.example/token');return handle(parts,create);};
+  const first=await new Downloader(c,disk,s=>logs.push(s)).run([rule()]);assert.equal(first.errors,1);assert.equal(c.downloads,1);
+  assert(logs.some(s=>s.includes('plugin.dll')&&s.includes('Chrome')&&s.includes('ファイル作成／TypeError')));assert(!logs.some(s=>s.includes('secret.example')));
+  const cache=await disk.json(['.fanbox-state','sample','7.zip-cache.json']);assert(!JSON.stringify(cache).includes('private'));assert.equal(Object.keys(cache.files).length,1);
+  const second=await new Downloader(c,disk,s=>logs.push(s),{onlyUnfinished:true}).run([rule()]);assert.equal(second.errors,1);assert.equal(c.downloads,1);assert(logs.some(s=>s.includes('再ダウンロードなし')));
+  assert.equal(await disk.json(['.fanbox-state','sample','7.json']),null);
+  blocked=false;const recovered=await new Downloader(c,disk,()=>{},{onlyUnfinished:true}).run([rule()]);assert.equal(recovered.saved,1);assert.equal(c.downloads,1);
+});
+
+test('ZIP retries fetch again after a post revision or local original ZIP changes',async()=>{
+  const p=post('8',{body:{files:[{url:'https://downloads.fanbox.cc/app.zip',extension:'zip'}]}}),disk=new Disk(new MemoryDirectory()),c=fakeClient([p],await archive([['plugin.dll','library']]));
+  const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(create&&parts.at(-1).endsWith('.dll'))throw new TypeError('blocked');return handle(parts,create);};
+  const run=()=>new Downloader(c,disk,()=>{},{onlyUnfinished:true}).run([rule()]);
+  await run();assert.equal(c.downloads,1);p.updatedDatetime='2026-11-02T15:00:00+09:00';await run();assert.equal(c.downloads,2);
+  const receipt=await disk.json(['.fanbox-state','sample','8.zip-cache.json']);const record=Object.values(receipt.files)[0].record;
+  await disk.write(record.parts,'changed');await run();assert.equal(c.downloads,3);
+  p.body.files[0].url+='?download=2';await run();assert.equal(c.downloads,4);
+  await new Downloader(c,disk,()=>{},{onExisting:async()=>({action:'redownload'})}).run([rule()]);assert.equal(c.downloads,5);
+});
+
+test('corrupt originals have a specific error and are never retained as reusable ZIPs',async()=>{
+  const p=post('9',{body:{files:[{url:'https://downloads.fanbox.cc/bad.zip',extension:'zip'}]}}),disk=new Disk(new MemoryDirectory()),c=fakeClient([p],new Blob(['broken'])),logs=[];
+  assert.equal((await new Downloader(c,disk,s=>logs.push(s)).run([rule()])).errors,1);
+  assert(logs.some(s=>s.includes('ZIP読み取り')&&s.includes('ZIPの構造')));
+  assert.deepEqual((await disk.json(['.fanbox-state','sample','9.zip-cache.json'])).files,{});
+  const good=await archive([['page.png','image']]);c.response=async()=>{c.downloads++;return new Response(good);};
+  assert.equal((await new Downloader(c,disk,()=>{},{onlyUnfinished:true}).run([rule()])).saved,1);assert.equal(c.downloads,2);
+});
+
+test('ZIP CRC errors identify the failing entry and preserve CRC validation',async()=>{
+  const writer=new zip.ZipWriter(new zip.BlobWriter(),{level:0});await writer.add('page.png',new zip.TextReader('original-data'));const bytes=Buffer.from(await(await writer.close()).arrayBuffer());
+  const at=bytes.indexOf(Buffer.from('original-data'));assert(at>=0);bytes[at]^=1;
+  const disk=new Disk(new MemoryDirectory());await disk.write(['bad.zip'],new Blob([bytes]));
+  await assert.rejects(()=>unzip(disk,['bad.zip'],['creator'],'test',false,new AbortController().signal),e=>e instanceof AppError&&e.invalidArchive&&e.message.includes('page.png')&&e.message.includes('整合性チェック'));
+});
+
+test('ZIP write quota and cancellation are distinguished from corrupt data',async()=>{
+  const bytes=await archive([['page.png','image']]),disk=new Disk(new MemoryDirectory());await disk.write(['test.zip'],bytes);
+  const original=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(create&&parts.at(-1).endsWith('.png'))throw new DOMException('full','QuotaExceededError');return original(parts,create);};
+  await assert.rejects(()=>unzip(disk,['test.zip'],['creator'],'test',false,new AbortController().signal),e=>e.message.includes('空き容量')&&e.message.includes('page.png')&&!e.invalidArchive);
+  const c=new AbortController();c.abort();await assert.rejects(()=>unzip(disk,['test.zip'],['creator'],'test',false,c.signal),{name:'AbortError'});
+});

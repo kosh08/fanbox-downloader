@@ -273,21 +273,53 @@ export function zipPaths(entries, prefix, grouped) {
   return result;
 }
 
+function zipFailure(error, archive, entry, phase) {
+  const lib=globalThis.zip;
+  const known=Object.keys(lib).find(k=>k.startsWith('ERR_')&&typeof lib[k]==='string'&&lib[k]===error?.message);
+  const dom=['NotAllowedError','SecurityError','QuotaExceededError','InvalidModificationError','NoModificationAllowedError','NotFoundError','TypeMismatchError','TypeError','NotReadableError'];
+  const code=known?.slice(4)||(dom.includes(error?.name)?error.name:'UNKNOWN');
+  const context=`ZIP「${String(archive.at(-1)).replace(/[\r\n]/g,' ')}」${entry?`／内部「${String(entry.filename).replace(/[\r\n]/g,' ')}」`:''}`;
+  let reason;
+  if(error instanceof AppError)reason=error.message;
+  else if(error?.name==='QuotaExceededError')reason='保存先の空き容量が不足しています。';
+  else if(['NotAllowedError','SecurityError'].includes(error?.name))reason='保存先へのアクセス、またはこのファイル形式の書き込みがChromeに拒否されました。';
+  else if(phase==='ファイル作成'&&/\.(dll|lnk|scf|url)$/i.test(entry?.filename||''))reason='Chromeのファイル保存制限で、この形式を書き込めない可能性があります。元ZIPをWindowsの「すべて展開」で展開してください。';
+  else if(['ERR_INVALID_CRC32','ERR_INVALID_COMPRESSED_DATA','ERR_INVALID_UNCOMPRESSED_SIZE'].includes(known))reason='ZIP内部データの整合性チェックに失敗しました。「まとめて保存」の再ダウンロードで元ZIPを取り直すか、Windowsでの展開を確認してください。';
+  else if(known==='ERR_UNSUPPORTED_COMPRESSION')reason=`このZIPの圧縮方式（${Number.isInteger(entry?.compressionMethod)?entry.compressionMethod:'不明'}）には対応していません。Windowsなどで展開してください。`;
+  else if(known==='ERR_SPLIT_ZIP_FILE')reason='分割ZIPのため、このファイルだけでは展開できません。';
+  else if(['ERR_ENCRYPTED','ERR_ENCRYPTED_CENTRAL_DIRECTORY','ERR_UNSUPPORTED_ENCRYPTION'].includes(known))reason='暗号化されたZIPは自動展開できません。';
+  else if(known&&/BAD_FORMAT|EOCDR|CENTRAL_DIRECTORY|LOCAL_FILE_HEADER/.test(known))reason='ZIPの構造を読み取れません。元ZIPの破損・不足や、ZIP以外の形式でないか確認してください。';
+  else if(phase==='ファイル作成')reason='展開先のファイルを作れません。ファイル形式の制限、名前・パスの長さ、書き込み権限を確認してください。';
+  else reason='この段階で展開に失敗しました。元ZIPをWindowsでも展開できるか確認してください。';
+  const result=new AppError(`${context}：${reason}［${phase}／${code}］ 元ZIPは保存先に残しています。`);
+  result.invalidArchive=Boolean(known&&/INVALID_CRC32|INVALID_COMPRESSED_DATA|INVALID_UNCOMPRESSED_SIZE|BAD_FORMAT|EOCDR|CENTRAL_DIRECTORY_NOT_FOUND|LOCAL_FILE_HEADER_NOT_FOUND/.test(known));
+  return result;
+}
+
 export async function unzip(disk, archive, destination, prefix, grouped, signal) {
   const zip = globalThis.zip;
   zip.configure({useWebWorkers: false});
-  const reader = new zip.ZipReader(new zip.BlobReader(await disk.file(archive)), {filenameEncoding: 'shift_jis'});
+  let reader,entry,phase='ZIP読み取り',failed=false;
   try {
-    const plan = zipPaths(await reader.getEntries(), prefix, grouped), records = [];
-    for (const {entry, path} of plan) {
+    reader = new zip.ZipReader(new zip.BlobReader(await disk.file(archive)), {filenameEncoding: 'shift_jis'});
+    const entries=await reader.getEntries();phase='事前確認';
+    const plan = zipPaths(entries, prefix, grouped), records = [];
+    for (const step of plan) {
       checkStop(signal);
-      const parts = [...destination, ...path], handle = await disk.handle(parts), writable = await handle.createWritable();
+      entry=step.entry;phase='ファイル作成';
+      const parts = [...destination, ...step.path], handle = await disk.handle(parts), writable = await handle.createWritable();
+      phase='展開・保存';
       try { await entry.getData(writable, {checkSignature: true, signal}); }
       catch (error) { try { await writable.abort(); } catch {} throw error; }
       records.push(await disk.record(parts));
     }
     return records;
-  } finally { await reader.close(); }
+  } catch(error) {
+    failed=true;checkStop(signal);if(error.name==='AbortError')throw error;
+    throw zipFailure(error,archive,entry,phase);
+  } finally {
+    try{await reader?.close();}catch(error){if(!failed){checkStop(signal);throw zipFailure(error,archive,entry,'ZIP終了処理');}}
+  }
 }
 
 export function userError(e) {
@@ -330,6 +362,10 @@ export class Downloader {
     if (!feeMatches(Number(post.feeRequired || 0), rule)) { this.count.filtered++; return; }
     const base = baseName(rule, post), destination = rule.grouped ? [folder, base] : [folder], records = [];
     const assets = collectAssets(post);
+    const revision=post.updatedDatetime??item.updatedDatetime;
+    const receiptPath=['.fanbox-state',safeName(rule.id),safeName(item.id)+'.zip-cache.json'];
+    const previous=revision?await this.disk.json(receiptPath):null;
+    const receipt=previous?.revision===revision&&previous?.policy===policy&&previous?.base===base&&previous?.files&&typeof previous.files==='object'&&!Array.isArray(previous.files)?previous:{revision,policy,base,files:{}};
     const targets = assets.map((asset,index) => {
       const prefix = `${base}_${String(index + 1).padStart(3, '0')}`;
       const original = asset.name ? '_' + safeName(asset.name.replace(/\.[^.]+$/, ''), 35) : '';
@@ -342,14 +378,26 @@ export class Downloader {
     for (const asset of targets) {
       checkStop(this.signal);
       const {prefix,parts}=asset;
-      this.log(`${assetKind(asset.ext)}を保存中：${parts.at(-1)}`);
-      const response = await this.client.response(asset.url);
-      if (/text\/html/i.test(response.headers.get('Content-Type') || '')) { await response.body?.cancel(); throw new AppError('ファイルの代わりにログイン画面が返されました。'); }
-      records.push(await this.disk.write(parts, response.body, this.signal));
+      const source=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(checkedURL(asset.url)))),b=>b.toString(16).padStart(2,'0')).join('');
+      const cached=receipt.files[prefix];let record;
+      if(this.options.onlyUnfinished&&revision&&cached?.source===source&&JSON.stringify(cached.record?.parts)===JSON.stringify(parts)&&await this.disk.valid([cached.record],this.signal)){
+        record=cached.record;this.log(`保存済みZIPを使用：${parts.at(-1)}（再ダウンロードなし）`);
+      }else{
+        this.log(`${assetKind(asset.ext)}を保存中：${parts.at(-1)}`);
+        const response = await this.client.response(asset.url);
+        if (/text\/html/i.test(response.headers.get('Content-Type') || '')) { await response.body?.cancel(); throw new AppError('ファイルの代わりにログイン画面が返されました。'); }
+        record=await this.disk.write(parts, response.body, this.signal);
+      }
+      records.push(record);
       const file = await this.disk.file(parts), signature = new Uint8Array(await file.slice(0, 4).arrayBuffer());
       if (asset.ext === 'zip' || (signature[0] === 80 && signature[1] === 75 && [3, 5, 7].includes(signature[2]))) {
+        receipt.files[prefix]={source,record};await this.disk.write(receiptPath,JSON.stringify(receipt),this.signal);
         this.log(`ZIP展開中：${parts.at(-1)}`);
-        records.push(...await unzip(this.disk, parts, destination, prefix, rule.grouped, this.signal));
+        try{records.push(...await unzip(this.disk, parts, destination, prefix, rule.grouped, this.signal));}
+        catch(error){
+          if(error.invalidArchive){delete receipt.files[prefix];await this.disk.write(receiptPath,JSON.stringify(receipt),this.signal);}
+          throw error;
+        }
       }
     }
     records.push(await this.disk.write([...destination, `${base}_本文.txt`], postText(rule, post), this.signal));
