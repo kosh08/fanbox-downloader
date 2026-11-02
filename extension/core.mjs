@@ -2,9 +2,33 @@ export class AppError extends Error {}
 export const API = 'https://api.fanbox.cc/';
 export const checkStop = signal => { if (signal?.aborted) throw new DOMException('停止しました。次回実行で再開できます。', 'AbortError'); };
 
+export function creatorIdFromInput(value) {
+  const input=String(value).trim();let id=input.replace(/^@/,'');
+  if(input.includes('://')){
+    let url;try{url=new URL(input);}catch{throw new AppError('FANBOXのクリエイターURLまたはIDを入力してください。');}
+    if(url.protocol!=='https:'||url.username||url.password||url.port)throw new AppError('httpsのFANBOXクリエイターURLを入力してください。');
+    if(['www.fanbox.cc','fanbox.cc'].includes(url.hostname))id=url.pathname.match(/^\/@([^/]+)(?:\/|$)/)?.[1]||'';
+    else id=url.hostname.match(/^([a-z0-9_-]+)\.fanbox\.cc$/i)?.[1]||'';
+  }
+  if(!/^[a-z0-9_-]{1,64}$/i.test(id)||['www','api','downloads'].includes(id.toLowerCase()))throw new AppError('FANBOXのクリエイターURLまたはIDを入力してください。例：https://creator-id.fanbox.cc/');
+  return id.toLowerCase();
+}
+
+export function creatorRules(active,stored={}) {
+  const make=(creator,old)=>({...creator,manual:old.manual===true,enabled:old.enabled??true,grouped:old.grouped??true,
+    includeFree:creator.supportedFee===0?true:(old.includeFree??false),mode:old.mode==='exact'?'exact':'max',
+    amount:Math.max(0,Math.min(Number.isFinite(old.amount)?old.amount:creator.supportedFee,creator.supportedFee))});
+  const result=new Map(active.map(c=>[c.id,make(c,stored[c.id]||{})]));
+  for(const old of Object.values(stored))if(old.manual===true&&old.id&&!result.has(old.id))result.set(old.id,make({id:old.id,name:old.name||old.id,supportedFee:0},old));
+  return [...result.values()];
+}
+
 export function unwrapBody(body, endpoint) {
   const fields = {'plan.listSupporting': ['plans', 'items'], 'post.paginateCreator': ['pageUrls'], 'post.listCreator': ['posts', 'items']};
-  if (endpoint === 'post.info') {
+  if (endpoint === 'creator.get') {
+    const creator=body?.creator??body;
+    if(creator&&typeof creator==='object'&&!Array.isArray(creator)&&typeof creator.creatorId==='string')return creator;
+  } else if (endpoint === 'post.info') {
     if (body === null) return null;
     if (body && typeof body === 'object' && !Array.isArray(body)) {
       if (Object.hasOwn(body, 'post')) {
@@ -163,6 +187,12 @@ export class Client {
       if (!result.has(id) || result.get(id).supportedFee < rule.supportedFee) result.set(id, rule);
     }
     return [...result.values()];
+  }
+  async creator(value) {
+    const id=creatorIdFromInput(value);
+    const creator=await this.api('creator.get?'+new URLSearchParams({creatorId:id}));
+    if(creator.creatorId.toLowerCase()!==id)throw new AppError('指定したクリエイターを確認できませんでした。');
+    return {id:creatorIdFromInput(creator.creatorId),name:creator.user?.name||id,supportedFee:0};
   }
   async *posts(id) {
     const pages = await this.api('post.paginateCreator?' + new URLSearchParams({creatorId: id}));
@@ -333,7 +363,7 @@ export class Downloader {
     for (const rule of rules.filter(r => r.enabled)) {
       if(this.options.retryFilter && !this.options.retryFilter.has(rule.id))continue;
       checkStop(this.signal);
-      this.log(`支援先：${rule.name} ／ ${rule.supportedFee}円で支援`);
+      this.log(rule.supportedFee===0?`クリエイター：${rule.name} ／ 無料投稿のみ`:`支援先：${rule.name} ／ ${rule.supportedFee}円で支援`);
       try {
         for await (const item of this.client.posts(rule.id)) {
           checkStop(this.signal);

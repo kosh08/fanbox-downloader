@@ -1,4 +1,4 @@
-import {AppError, Client, Disk, Downloader, userError, failureIdsFromLog} from './core.mjs';
+import {AppError, Client, Disk, Downloader, userError, failureIdsFromLog, creatorRules, creatorIdFromInput} from './core.mjs';
 import {githubPackage, zipPackage, applyPackage, validateFolder, sha256} from './update.mjs';
 
 const $ = id => document.getElementById(id);
@@ -76,7 +76,23 @@ function render() {
     }
     cell().append(checkbox('enabled'));
     const name = cell(); name.append(node('strong', rule.name), node('small', '@' + rule.id));
-    cell().textContent = `${rule.supportedFee.toLocaleString()} 円`;
+    if(rule.manual){
+      name.append(node('small','個別追加','manual-tag'));
+      const remove=node('button','一覧から外す','remove-creator secondary');remove.type='button';remove.setAttribute('aria-label',`${rule.name}：個別追加を解除`);
+      remove.addEventListener('click',async()=>{
+        rule.manual=false;storedRules[rule.id]={...rule};if(rule.supportedFee===0)rules=rules.filter(r=>r.id!==rule.id);
+        try{await saveRules();render();log(`${rule.name}の個別追加を解除しました。`);}catch(e){showError(e);}
+      });name.append(remove);
+    }
+    cell().textContent = rule.supportedFee===0?'無料のみ':`${rule.supportedFee.toLocaleString()} 円`;
+    const freeOnly=rule.supportedFee===0;
+    if(freeOnly){
+      cell().append(node('span','無料投稿のみ'));
+      const groupLabel=node('label',undefined,'group-label');groupLabel.append(checkbox('grouped'),node('span','作る'));cell().append(groupLabel);
+      cell().textContent='含める';
+      for(const control of row.querySelectorAll('button,input,select'))control.disabled=busy;
+      $('creators').append(row);continue;
+    }
     const amountCell = cell(), amount = node('input'), mode = node('select');
     amount.type = 'number'; amount.min = 0; amount.max = rule.supportedFee; amount.step = 1; amount.value = rule.amount;
     amount.setAttribute('aria-label', `${rule.name}：取得金額`);
@@ -92,6 +108,7 @@ function render() {
     amountCell.append(amount, mode);
     const groupLabel = node('label', undefined, 'group-label'); groupLabel.append(checkbox('grouped'), node('span', '作る')); cell().append(groupLabel);
     const freeLabel = node('label', undefined, 'group-label'); freeLabel.append(checkbox('includeFree'), node('span', '含める')); cell().append(freeLabel);
+    for(const control of row.querySelectorAll('button,input,select'))control.disabled=busy;
     $('creators').append(row);
   }
 }
@@ -163,19 +180,25 @@ $('folder').addEventListener('click', async () => {
 $('connect').addEventListener('click', () => task(async client => {
   log('現在の支援先と支援額を確認中…');
   const active = await client.supporting();
-  rules = active.map(creator => {
-    const old = storedRules[creator.id] || {};
-    return {...creator, enabled: old.enabled ?? true, grouped: old.grouped ?? true, includeFree: old.includeFree ?? false,
-      mode: old.mode === 'exact' ? 'exact' : 'max', amount: Math.max(0, Math.min(Number.isFinite(old.amount) ? old.amount : creator.supportedFee, creator.supportedFee))};
-  });
+  rules = creatorRules(active,storedRules);
   render(); await saveRules();
-  $('connection').textContent = `ログイン確認済み・支援先 ${rules.length} 件`;
-  log(`${rules.length}件の支援先を読み込みました。`);
+  $('connection').textContent = `ログイン確認済み・支援先 ${active.length} 件 ／ 保存対象 ${rules.length} 件`;
+  log(`保存対象を${rules.length}件読み込みました（個別追加を含む）。`);
 }));
+
+$('add-creator').addEventListener('click',()=>task(async client=>{
+  const id=creatorIdFromInput($('creator-input').value);
+  if(rules.some(r=>r.id===id)){log('このクリエイターはすでに一覧にあります。');return;}
+  log('クリエイターを確認中…');const creator=await client.creator(id);
+  const added=creatorRules([],{[creator.id]:{...storedRules[creator.id],...creator,manual:true,enabled:true}})[0];
+  rules.push(added);await saveRules();render();$('creator-input').value='';
+  log(`${creator.name}を個別追加しました。無料投稿を保存できます。`);
+}));
+$('creator-input').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();if(!busy)$('add-creator').click();}});
 
 async function start(preview,mode='normal') {
   if (busy) return;
-  if (!rules.some(r => r.enabled)) { log('先に支援先を読み込み、取得する支援先を選んでください。'); return; }
+  if (!rules.some(r => r.enabled)) { log('支援先を読み込むか個別追加し、取得するクリエイターを選んでください。'); return; }
   if (!preview) {
     if (!rootHandle) { log('保存先フォルダを選んでください。'); return; }
     try { if (await rootHandle.requestPermission({mode: 'readwrite'}) !== 'granted') { log('保存先へのアクセスを許可してください。'); return; } }
@@ -190,16 +213,16 @@ async function start(preview,mode='normal') {
       const active = new Map((await client.supporting()).map(r => [r.id, r]));
       const verified = [];
       for (const rule of rules.filter(r => r.enabled)) {
-        if (!active.has(rule.id)) { log(`支援終了のため除外：${rule.name}`); continue; }
-        const fee = active.get(rule.id).supportedFee;
-        verified.push({...rule, supportedFee: fee, amount: Math.min(rule.amount, fee)});
+        if (!active.has(rule.id)&&!rule.manual) { log(`支援終了のため除外：${rule.name}`); continue; }
+        const fee = active.get(rule.id)?.supportedFee||0;
+        verified.push({...rule, supportedFee: fee, amount: Math.min(rule.amount, fee),includeFree:fee===0&&rule.manual?true:rule.includeFree});
       }
       let retryFilter=null;
       if(mode==='failed'){
         for(const [key,entry]of Object.entries(failureStore.items).filter(([,e])=>!e.creatorId)){
           try{
             const post=await client.api('post.info?'+new URLSearchParams({postId:entry.postId}));
-            if(!post?.creatorId||!verified.some(r=>r.id===post.creatorId)){log(`投稿 ${entry.postId}：現在選択中の支援先として確認できません。`);continue;}
+            if(!post?.creatorId||!verified.some(r=>r.id===post.creatorId)){log(`投稿 ${entry.postId}：現在選択中のクリエイターとして確認できません。`);continue;}
             const r=verified.find(r=>r.id===post.creatorId);delete failureStore.items[key];failureStore.items[`${r.id}/${entry.postId}`]={...entry,creatorId:r.id,creatorName:r.name,title:post.title||''};
           }catch(e){if(e.name==='AbortError')throw e;log(`投稿 ${entry.postId}：${userError(e)}`);}
         }
@@ -322,6 +345,7 @@ async function init() {
   state(true);
   try {
     storedRules = (await chrome.storage.local.get('rules')).rules || {};
+    rules=creatorRules([],storedRules);render();
     rootHandle = await loadHandle(); await folderStatus();
     failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
     updateHandle=await loadHandle('update-folder');

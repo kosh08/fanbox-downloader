@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
-import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind, failureIdsFromLog} from '../core.mjs';
+import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind, failureIdsFromLog, creatorIdFromInput, creatorRules} from '../core.mjs';
 const require = createRequire(import.meta.url);
 globalThis.zip = require('../vendor/zip-native.min.js');
 zip.configure({useWebWorkers: false});
@@ -248,4 +248,38 @@ test('journal persistence errors do not turn saved posts into failures',async()=
 test('old log import extracts unique failed post IDs without keeping titles, URLs or other lines',()=>{
   assert.deepEqual(failureIdsFromLog('投稿保存完了：作品_p1\n投稿 123：HTTP 404 https://private.example/token\n投稿 456:失敗\n投稿 123：再失敗\n対象候補：789 ／ 題名\n無関係な投稿 999：文字列'),['123','456']);
   assert.deepEqual(failureIdsFromLog(''),[]);
+});
+
+
+test('manual creator input accepts FANBOX URLs and IDs and rejects other origins and malformed IDs',()=>{
+  for(const input of [' sample-creator ','@sample-creator','https://sample-creator.fanbox.cc/','https://sample-creator.fanbox.cc/posts/123','https://www.fanbox.cc/@sample-creator/posts/123?x=1#comments','https://fanbox.cc/@sample-creator'])assert.equal(creatorIdFromInput(input),'sample-creator');
+  for(const input of ['','https://fanbox.cc/','https://www.fanbox.cc/posts/123','https://sample.fanbox.cc.evil.test/','https://foo.bar.fanbox.cc/','https://user:pass@sample.fanbox.cc/','http://sample.fanbox.cc/','https://sample.fanbox.cc:444/','../sample','sample?x=1','@@sample','@api'])assert.throws(()=>creatorIdFromInput(input),AppError);
+});
+
+test('creator lookup handles both response wrappers and validates the returned identity',async()=>{
+  for(const wrap of [c=>c,c=>({creator:c})]){
+    const client=new Client(new AbortController().signal,async(url,options)=>{
+      assert.equal(new URL(url).pathname,'/creator.get');assert.equal(new URL(url).searchParams.get('creatorId'),'sample');assert.equal(options.credentials,'include');
+      return Response.json({body:wrap({creatorId:'sample',user:{name:'無料の作家'}})});
+    });
+    assert.deepEqual(await client.creator('https://sample.fanbox.cc/'),{id:'sample',name:'無料の作家',supportedFee:0});
+  }
+  const bad=new Client(new AbortController().signal,async()=>Response.json({body:{creatorId:'other',user:{name:'Wrong'}}}));
+  await assert.rejects(()=>bad.creator('sample'),/確認できません/);
+  for(const body of [null,[],{creator:null},{user:{name:'missing id'}}])assert.throws(()=>unwrapBody(body,'creator.get'),AppError);
+});
+
+test('manual creators survive an empty supporting list and remain free-only after support ends',()=>{
+  const stored={free:{id:'free',name:'無料作家',manual:true,enabled:false,grouped:false,includeFree:false,amount:1000,supportedFee:1000},ended:{id:'ended',name:'終了',amount:500}};
+  const merged=creatorRules([],stored);assert.equal(merged.length,1);
+  const r=merged[0];assert.equal(r.id,'free');assert.equal(r.supportedFee,0);assert.equal(r.amount,0);assert.equal(r.includeFree,true);assert.equal(r.grouped,false);assert.equal(r.enabled,false);
+  assert(feeMatches(0,r));assert(!feeMatches(1,r));assert(!feeMatches(500,r));
+  assert.equal(creatorRules([],{...stored,free:{...r,manual:false}}).length,0);
+});
+
+test('supported and manual creators merge without duplicates and preserve settings',()=>{
+  const stored={same:{id:'same',name:'Old name',manual:true,grouped:false,enabled:true,amount:500,mode:'exact',includeFree:true},free:{id:'free',name:'Free',manual:true}};
+  const rules=creatorRules([{id:'same',name:'Current name',supportedFee:300}],stored);
+  assert.equal(rules.length,2);assert.equal(rules[0].name,'Current name');assert.equal(rules[0].amount,300);assert.equal(rules[0].grouped,false);assert.equal(rules[0].manual,true);assert.equal(rules[0].mode,'exact');
+  assert.equal(rules[1].supportedFee,0);assert.equal(rules[1].includeFree,true);
 });
