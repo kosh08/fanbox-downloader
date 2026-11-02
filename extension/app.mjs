@@ -1,8 +1,9 @@
-import {AppError, Client, Disk, Downloader, userError} from './core.mjs';
+import {AppError, Client, Disk, Downloader, userError, failureIdsFromLog} from './core.mjs';
 import {githubPackage, zipPackage, applyPackage, validateFolder, sha256} from './update.mjs';
 
 const $ = id => document.getElementById(id);
 let rules = [], storedRules = {}, rootHandle = null, updateHandle = null, busy = false, controller;
+let failureStores=[],failureStore=null;
 const RULE_ID = 73001;
 const showError = e => log(userError(e));
 
@@ -19,12 +20,38 @@ function state(value) {
   busy = value;
   for (const element of document.querySelectorAll('button,input,select')) element.disabled = value;
   $('stop').disabled = !value;
+  $('retry-failed').disabled=value || !Object.keys(failureStore?.items||{}).length;
   $('dot').classList.toggle('running', value);
 }
 
 async function saveRules() {
   storedRules = {...storedRules, ...Object.fromEntries(rules.map(r => [r.id, r]))};
   await chrome.storage.local.set({rules: storedRules});
+}
+
+function showFailures(){
+  const entries=Object.values(failureStore?.items||{});
+  $('failure-count').textContent=String(entries.length);
+  $('retry-failed').disabled=busy||!entries.length;
+  $('failure-list').replaceChildren();
+  for(const entry of entries.slice(-200))$('failure-list').append(node('div',`${entry.creatorName||'支援先未確認'} ／ ${entry.postId?'投稿 '+entry.postId+' '+(entry.title||''):'一覧の取得'}：${entry.error}`));
+}
+async function selectFailureStore(){
+  failureStore=null;
+  if(rootHandle){
+    for(const archive of failureStores){try{if(await archive.handle.isSameEntry(rootHandle)){failureStore=archive;break;}}catch{}}
+    if(!failureStore){failureStore={handle:rootHandle,items:{}};failureStores.push(failureStore);}
+  }
+  showFailures();
+}
+async function persistFailures(){showFailures();await storeHandle(failureStores,'failure-stores');}
+async function recordFailure({rule,item,error}){
+  const key=`${rule.id}/${item?.id||'*'}`;
+  failureStore.items[key]={creatorId:rule.id,creatorName:rule.name,postId:item?String(item.id):null,title:item?.title||'',error,at:new Date().toISOString()};
+  await persistFailures();
+}
+async function clearFailure({rule,item}){
+  delete failureStore.items[`${rule.id}/${item.id}`];delete failureStore.items[`?/${item.id}`];await persistFailures();
 }
 
 function node(tag, text, className) {
@@ -128,6 +155,8 @@ $('folder').addEventListener('click', async () => {
   try {
     rootHandle = await window.showDirectoryPicker({id: 'fanbox-archive', mode: 'readwrite'});
     await storeHandle(rootHandle); await folderStatus();
+    failureStores=await loadHandle('failure-stores')||[];
+    await selectFailureStore();
   } catch (e) { if (e.name !== 'AbortError') showError(e); }
 });
 
@@ -144,7 +173,7 @@ $('connect').addEventListener('click', () => task(async client => {
   log(`${rules.length}件の支援先を読み込みました。`);
 }));
 
-async function start(preview) {
+async function start(preview,mode='normal') {
   if (busy) return;
   if (!rules.some(r => r.enabled)) { log('先に支援先を読み込み、取得する支援先を選んでください。'); return; }
   if (!preview) {
@@ -155,6 +184,7 @@ async function start(preview) {
   await task(async client => {
     await navigator.locks.request('fanbox-archive-run', {ifAvailable: true}, async lock => {
       if (!lock) throw new AppError('別の管理画面で処理中です。そちらの完了を待ってください。');
+      failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
       await saveRules();
       log(preview ? '保存せずに投稿候補を確認します…' : '現在の支援状況を確認して保存を開始します…');
       const active = new Map((await client.supporting()).map(r => [r.id, r]));
@@ -164,7 +194,27 @@ async function start(preview) {
         const fee = active.get(rule.id).supportedFee;
         verified.push({...rule, supportedFee: fee, amount: Math.min(rule.amount, fee)});
       }
-      await new Downloader(client, preview ? null : new Disk(rootHandle), log, {onExisting: askExisting}).run(verified, preview);
+      let retryFilter=null;
+      if(mode==='failed'){
+        for(const [key,entry]of Object.entries(failureStore.items).filter(([,e])=>!e.creatorId)){
+          try{
+            const post=await client.api('post.info?'+new URLSearchParams({postId:entry.postId}));
+            if(!post?.creatorId||!verified.some(r=>r.id===post.creatorId)){log(`投稿 ${entry.postId}：現在選択中の支援先として確認できません。`);continue;}
+            const r=verified.find(r=>r.id===post.creatorId);delete failureStore.items[key];failureStore.items[`${r.id}/${entry.postId}`]={...entry,creatorId:r.id,creatorName:r.name,title:post.title||''};
+          }catch(e){if(e.name==='AbortError')throw e;log(`投稿 ${entry.postId}：${userError(e)}`);}
+        }
+        await persistFailures();retryFilter=new Map();
+        for(const entry of Object.values(failureStore.items)){
+          if(!entry.creatorId)continue;
+          if(!entry.postId){retryFilter.set(entry.creatorId,null);continue;}
+          if(!retryFilter.has(entry.creatorId))retryFilter.set(entry.creatorId,new Set());
+          retryFilter.get(entry.creatorId)?.add(entry.postId);
+        }
+        if(!retryFilter.size){log('再試行できる投稿がありません。支援先の選択と失敗履歴を確認してください。');return;}
+      }
+      log(mode==='unfinished'?'完了済み投稿は確認してスキップし、未完了・未取得分だけを保存します。':mode==='failed'?'記録された失敗分だけを再試行します。':'投稿の取得を開始します。');
+      await new Downloader(client, preview ? null : new Disk(rootHandle), log, {onExisting: askExisting,onlyUnfinished:mode!=='normal',retryFilter,
+        onFailure:recordFailure,onSuccess:clearFailure,onCreatorSuccess:async({rule})=>{delete failureStore.items[`${rule.id}/*`];await persistFailures();}}).run(verified, preview);
     });
   });
 }
@@ -196,6 +246,24 @@ function askExisting({rule,item,namingChanged}) {
 
 $('preview').addEventListener('click', () => start(true).catch(showError));
 $('download').addEventListener('click', () => start(false).catch(showError));
+$('retry-failed').addEventListener('click',()=>start(false,'failed').catch(showError));
+$('retry-unfinished').addEventListener('click',()=>start(false,'unfinished').catch(showError));
+$('import-failures').addEventListener('click',async()=>{
+  if(busy)return;
+  if(!rootHandle){log('先に作品の保存先フォルダを選んでください。');return;}
+  state(true);$('stop').disabled=true;
+  try{
+    const [handle]=await showOpenFilePicker({types:[{description:'失敗ログ',accept:{'text/plain':['.txt','.log']}}]});const file=await handle.getFile();
+    if(file.size>50*1024*1024)throw new AppError('50MB以下のログを選んでください。');
+    const ids=failureIdsFromLog(await file.text());
+    await navigator.locks.request('fanbox-archive-run',{ifAvailable:true},async lock=>{
+      if(!lock)throw new AppError('別の管理画面で処理中です。そちらの完了を待ってください。');
+      failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
+      for(const id of ids){if(!Object.values(failureStore.items).some(e=>e.postId===id))failureStore.items[`?/${id}`]={creatorId:null,creatorName:'過去ログ',postId:id,title:'',error:'ログから取り込み',at:new Date().toISOString()};}
+      await persistFailures();log(`${ids.length}件の失敗投稿IDを取り込みました。支援先を読み込んで「失敗分だけ再試行」を押してください。`);
+    });
+  }catch(e){if(e.name!=='AbortError')showError(e);}finally{state(false);}
+});
 $('stop').addEventListener('click', () => controller?.abort());
 function showUpdateSetup() {
   $('update-folder-name').textContent=updateHandle?updateHandle.name:'未設定';
@@ -255,6 +323,7 @@ async function init() {
   try {
     storedRules = (await chrome.storage.local.get('rules')).rules || {};
     rootHandle = await loadHandle(); await folderStatus();
+    failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
     updateHandle=await loadHandle('update-folder');
     showUpdateSetup();
     $('installed-version').textContent='v'+chrome.runtime.getManifest().version;

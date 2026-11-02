@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
-import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind} from '../core.mjs';
+import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind, failureIdsFromLog} from '../core.mjs';
 const require = createRequire(import.meta.url);
 globalThis.zip = require('../vendor/zip-native.min.js');
 zip.configure({useWebWorkers: false});
@@ -190,4 +190,62 @@ test('direct video and audio attachments save their original bytes and title',as
   }
   assert(logs.some(s=>s.startsWith('動画を保存中')));assert(logs.some(s=>s.startsWith('音声を保存中')));
   assert.equal(assetKind('wav'),'音声');assert.equal(assetKind('webm'),'動画');
+});
+
+
+test('unfinished recovery preserves completed posts and retries partial and new posts without prompts',async()=>{
+  const root=new MemoryDirectory(),disk=new Disk(root),c=fakeClient([post('1')]);
+  await new Downloader(c,disk).run([rule()]);
+  c.posts=async function*(){yield post('1');yield post('2');yield post('3');};
+  c.api=async path=>post(new URLSearchParams(path.split('?')[1]).get('postId'));
+  const base=baseName(rule(),post('2'));
+  await disk.write(['作家__sample',base,base+'_001.jpg'],'partial');
+  const complete=await disk.json(['.fanbox-state','sample','1.json']);
+  complete.policy='old-format';await disk.write(['.fanbox-state','sample','1.json'],JSON.stringify(complete));
+  const successes=[];
+  const result=await new Downloader(c,disk,()=>{},{onlyUnfinished:true,onExisting:()=>{throw Error('Must not prompt');},onSuccess:({item})=>successes.push(item.id)}).run([rule()]);
+  assert.equal(result.saved,2);assert.equal(result.skipped,1);assert.equal(result.errors,0);assert.equal(c.downloads,3);
+  assert.deepEqual(successes,['1','2','3']);assert(await disk.valid(complete.files));
+});
+
+test('unfinished recovery repairs missing or changed files inside completed posts',async()=>{
+  const root=new MemoryDirectory(),disk=new Disk(root),c=fakeClient();await new Downloader(c,disk).run([rule()]);
+  const state=await disk.json(['.fanbox-state','sample','1.json']);await disk.write(state.files[0].parts,'broken');
+  const result=await new Downloader(c,disk,()=>{},{onlyUnfinished:true}).run([rule()]);
+  assert.equal(result.saved,1);assert.equal(c.downloads,2);
+  assert.equal(await(await disk.file(state.files[0].parts)).text(),'image');
+});
+
+test('retry filter saves only recorded failures and reports post errors and completion',async()=>{
+  const c=fakeClient([post('1'),post('2'),post('3')]),disk=new Disk(new MemoryDirectory()),failures=[],successes=[],scans=[];
+  const original=c.response;c.response=async function(url){if(url.includes('a.jpg'))throw new AppError('HTTP 404');return original.call(this,url);};
+  const options={onlyUnfinished:true,retryFilter:new Map([['sample',new Set(['2'])]]),onFailure:e=>failures.push(e),onSuccess:e=>successes.push(e.item.id),onCreatorSuccess:e=>scans.push(e.rule.id)};
+  const first=await new Downloader(c,disk,()=>{},options).run([rule()]);
+  assert.equal(first.errors,1);assert.equal(failures.length,1);assert.equal(failures[0].item.id,'2');assert.equal(scans.length,1);
+  c.response=original;
+  const result=await new Downloader(c,disk,()=>{},options).run([rule()]);
+  assert.equal(result.saved,1);assert.equal(c.downloads,1);assert.deepEqual(successes,['2']);
+  assert.equal(await disk.json(['.fanbox-state','sample','1.json']),null);
+  assert.equal(await disk.json(['.fanbox-state','sample','3.json']),null);
+});
+
+test('listing errors have a creator-level failure; cancellation and previews do not add history',async()=>{
+  const failures=[],c=fakeClient(),options={onFailure:e=>failures.push(e)};
+  c.posts=async function*(){throw new AppError('list failed');};
+  assert.equal((await new Downloader(c,new Disk(new MemoryDirectory()),()=>{},options).run([rule()])).errors,1);
+  assert.equal(failures.length,1);assert.equal(failures[0].item,null);
+  await new Downloader(c,null,()=>{},options).run([rule()],true);assert.equal(failures.length,1);
+  c.posts=async function*(){throw new DOMException('cancel','AbortError');};
+  await assert.rejects(()=>new Downloader(c,null,()=>{},options).run([rule()]),{name:'AbortError'});assert.equal(failures.length,1);
+});
+
+test('journal persistence errors do not turn saved posts into failures',async()=>{
+  const logs=[],c=fakeClient(),disk=new Disk(new MemoryDirectory());
+  const result=await new Downloader(c,disk,s=>logs.push(s),{onSuccess:()=>{throw Error('quota');}}).run([rule()]);
+  assert.equal(result.saved,1);assert.equal(result.errors,0);assert(logs.some(s=>s.includes('履歴の保存に失敗')));
+});
+
+test('old log import extracts unique failed post IDs without keeping titles, URLs or other lines',()=>{
+  assert.deepEqual(failureIdsFromLog('投稿保存完了：作品_p1\n投稿 123：HTTP 404 https://private.example/token\n投稿 456:失敗\n投稿 123：再失敗\n対象候補：789 ／ 題名\n無関係な投稿 999：文字列'),['123','456']);
+  assert.deepEqual(failureIdsFromLog(''),[]);
 });

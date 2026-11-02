@@ -269,7 +269,11 @@ export function userError(e) {
 }
 
 export class Downloader {
-  constructor(client, disk, log = () => {}, options = {}) { this.client = client; this.disk = disk; this.log = log; this.signal = client.signal; this.onExisting = options.onExisting || (async () => ({action:'skip'})); this.existingAction = null; this.count = {saved: 0, skipped: 0, filtered: 0, restricted: 0, errors: 0}; }
+  constructor(client, disk, log = () => {}, options = {}) { this.client = client; this.disk = disk; this.log = log; this.signal = client.signal; this.options=options;this.onExisting = options.onExisting || (async () => ({action:'skip'})); this.existingAction = null; this.count = {saved: 0, skipped: 0, filtered: 0, restricted: 0, errors: 0}; }
+  async notify(name,value) {
+    try{await this.options[name]?.(value);}
+    catch{this.log('失敗履歴の保存に失敗しました。このタブを閉じる前にログを保存してください。');}
+  }
   async confirmExisting(rule, item, namingChanged) {
     checkStop(this.signal);
     const answer = this.existingAction ? {action:this.existingAction} : await this.onExisting({rule,item,namingChanged});
@@ -285,8 +289,12 @@ export class Downloader {
     const statePath = ['.fanbox-state', safeName(rule.id), safeName(item.id) + '.json'];
     const policy = JSON.stringify({grouped: rule.grouped, folder, version: 2});
     const old = await this.disk.json(statePath);
+    if(this.options.onlyUnfinished && old?.files?.length && await this.disk.valid(old.files,this.signal)) {
+      this.count.skipped++;this.log(`保存完了を確認・スキップ：${item.id}`);
+      await this.notify('onSuccess',{rule,item});return;
+    }
     const existing = old?.files?.length && await this.disk.existsAny(old.files, this.signal);
-    if(existing && !await this.confirmExisting(rule,item,old.policy !== policy || old.base !== baseName(rule,item))) return;
+    if(!this.options.onlyUnfinished && existing && !await this.confirmExisting(rule,item,old.policy !== policy || old.base !== baseName(rule,item))) return;
     const post = await this.client.api('post.info?' + new URLSearchParams({postId: item.id}));
     if (post?.isRestricted || post?.body == null) { this.count.restricted++; this.log(`閲覧不可：${item.id}`); return; }
     if (!feeMatches(Number(post.feeRequired || 0), rule)) { this.count.filtered++; return; }
@@ -298,7 +306,7 @@ export class Downloader {
       const parts = [...destination, `${prefix}${original}.${asset.ext}`];
       return {...asset,prefix,parts};
     });
-    if(!existing && await this.disk.existsAny([...targets.map(a=>({parts:a.parts})),{parts:[...destination,`${base}_本文.txt`]}],this.signal)) {
+    if(!this.options.onlyUnfinished && !existing && await this.disk.existsAny([...targets.map(a=>({parts:a.parts})),{parts:[...destination,`${base}_本文.txt`]}],this.signal)) {
       if(!await this.confirmExisting(rule,post,false)) return;
     }
     for (const asset of targets) {
@@ -318,25 +326,38 @@ export class Downloader {
     await this.disk.write(statePath, JSON.stringify({policy, base, updated: post.updatedDatetime ?? item.updatedDatetime, files: records}), this.signal);
     this.count.saved++;
     this.log(`投稿保存完了：${base}`);
+    await this.notify('onSuccess',{rule,item});
   }
   async run(rules, preview = false) {
     this.existingAction=null;
     for (const rule of rules.filter(r => r.enabled)) {
+      if(this.options.retryFilter && !this.options.retryFilter.has(rule.id))continue;
       checkStop(this.signal);
       this.log(`支援先：${rule.name} ／ ${rule.supportedFee}円で支援`);
       try {
         for await (const item of this.client.posts(rule.id)) {
           checkStop(this.signal);
+          const targets=this.options.retryFilter?.get(rule.id);
+          if(targets && !targets.has(String(item.id)))continue;
           if (!feeMatches(Number(item.feeRequired || 0), rule)) { this.count.filtered++; continue; }
           if (item.isRestricted) { this.count.restricted++; continue; }
           if (preview) { this.count.saved++; this.log(`対象候補：${item.id} ／ ${item.title || ''} ／ ${item.feeRequired}円`); continue; }
           try { await this.save(rule, item); }
-          catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`投稿 ${item.id}：${userError(error)}`); }
+          catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`投稿 ${item.id}：${userError(error)}`);await this.notify('onFailure',{rule,item,error:userError(error)}); }
         }
-      } catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`${rule.name}：${userError(error)}`); }
+        if(!preview)await this.notify('onCreatorSuccess',{rule});
+      } catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`${rule.name}：${userError(error)}`);if(!preview)await this.notify('onFailure',{rule,item:null,error:userError(error)}); }
     }
     const c = this.count;
     this.log(`終了：${preview ? '候補' : '保存'} ${c.saved} ／ 保存済み ${c.skipped} ／ 金額対象外 ${c.filtered} ／ 閲覧不可 ${c.restricted} ／ 失敗 ${c.errors}`);
     return c;
   }
+}
+
+export function failureIdsFromLog(text) {
+  const ids=new Set();
+  for(const match of String(text).matchAll(/^\s*投稿\s+(\d+)\s*[：:]/gm)){
+    ids.add(match[1]);if(ids.size>20000)throw new AppError('失敗投稿が2万件を超えます。ログを分けて取り込んでください。');
+  }
+  return [...ids];
 }
