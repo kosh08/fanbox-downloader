@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
-import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind, failureIdsFromLog, creatorIdFromInput, creatorRules} from '../core.mjs';
+import {AppError, Client, Disk, Downloader, baseName, collectAssets, feeMatches, checkedURL, safeName, zipPaths, unzip, unwrapBody, assetKind, failureIdsFromLog, creatorIdFromInput, creatorRules, progressPath} from '../core.mjs';
 const require = createRequire(import.meta.url);
 globalThis.zip = require('../vendor/zip-native.min.js');
 zip.configure({useWebWorkers: false});
@@ -287,10 +287,10 @@ test('supported and manual creators merge without duplicates and preserve settin
 
 test('ZIP write refusal identifies its file and reuses the verified original ZIP on retry',async()=>{
   const root=new MemoryDirectory(),disk=new Disk(root),p=post('7',{body:{files:[{url:'https://downloads.fanbox.cc/application.zip?token=private',extension:'zip'}]}});
-  const c=fakeClient([p],await archive([['data.bundle','data'],['Runtime/plugin.dll','library']])),logs=[];
-  let blocked=true;const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(blocked&&create&&parts.at(-1).endsWith('.dll'))throw new TypeError('untrusted message https://secret.example/token');return handle(parts,create);};
+  const c=fakeClient([p],await archive([['data.bundle','data'],['Runtime/page.png','library']])),logs=[];
+  let blocked=true;const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(blocked&&create&&parts.at(-1).endsWith('.png'))throw new DOMException('untrusted message https://secret.example/token','QuotaExceededError');return handle(parts,create);};
   const first=await new Downloader(c,disk,s=>logs.push(s)).run([rule()]);assert.equal(first.errors,1);assert.equal(c.downloads,1);
-  assert(logs.some(s=>s.includes('plugin.dll')&&s.includes('Chrome')&&s.includes('ファイル作成／TypeError')));assert(!logs.some(s=>s.includes('secret.example')));
+  assert(logs.some(s=>s.includes('page.png')&&s.includes('空き容量')&&s.includes('ファイル作成／QuotaExceededError')));assert(!logs.some(s=>s.includes('secret.example')));
   const cache=await disk.json(['.fanbox-state','sample','7.zip-cache.json']);assert(!JSON.stringify(cache).includes('private'));assert.equal(Object.keys(cache.files).length,1);
   const second=await new Downloader(c,disk,s=>logs.push(s),{onlyUnfinished:true}).run([rule()]);assert.equal(second.errors,1);assert.equal(c.downloads,1);assert(logs.some(s=>s.includes('再ダウンロードなし')));
   assert.equal(await disk.json(['.fanbox-state','sample','7.json']),null);
@@ -298,8 +298,8 @@ test('ZIP write refusal identifies its file and reuses the verified original ZIP
 });
 
 test('ZIP retries fetch again after a post revision or local original ZIP changes',async()=>{
-  const p=post('8',{body:{files:[{url:'https://downloads.fanbox.cc/app.zip',extension:'zip'}]}}),disk=new Disk(new MemoryDirectory()),c=fakeClient([p],await archive([['plugin.dll','library']]));
-  const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(create&&parts.at(-1).endsWith('.dll'))throw new TypeError('blocked');return handle(parts,create);};
+  const p=post('8',{body:{files:[{url:'https://downloads.fanbox.cc/app.zip',extension:'zip'}]}}),disk=new Disk(new MemoryDirectory()),c=fakeClient([p],await archive([['page.png','image']]));
+  const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(create&&parts.at(-1).endsWith('.png'))throw new DOMException('full','QuotaExceededError');return handle(parts,create);};
   const run=()=>new Downloader(c,disk,()=>{},{onlyUnfinished:true}).run([rule()]);
   await run();assert.equal(c.downloads,1);p.updatedDatetime='2026-11-02T15:00:00+09:00';await run();assert.equal(c.downloads,2);
   const receipt=await disk.json(['.fanbox-state','sample','8.zip-cache.json']);const record=Object.values(receipt.files)[0].record;
@@ -329,4 +329,36 @@ test('ZIP write quota and cancellation are distinguished from corrupt data',asyn
   const original=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(create&&parts.at(-1).endsWith('.png'))throw new DOMException('full','QuotaExceededError');return original(parts,create);};
   await assert.rejects(()=>unzip(disk,['test.zip'],['creator'],'test',false,new AbortController().signal),e=>e.message.includes('空き容量')&&e.message.includes('page.png')&&!e.invalidArchive);
   const c=new AbortController();c.abort();await assert.rejects(()=>unzip(disk,['test.zip'],['creator'],'test',false,c.signal),{name:'AbortError'});
+});
+
+
+test('incremental scan skips unchanged detail and file access, detects old edits, and retries failures',async()=>{
+ const p1=post('1'),p2=post('2'),items=[p1,p2],c=fakeClient(items),disk=new Disk(new MemoryDirectory());let infos=0;const api=c.api;c.api=async p=>{infos++;return api.call(c,p);};
+ const opts={incremental:true,onlyUnfinished:true,trackProgress:true};const run=()=>new Downloader(c,disk,()=>{},opts).run([rule()]);
+ assert.equal((await run()).saved,2);assert.equal(infos,2);const savedProgress=await disk.json(progressPath('sample'));assert.equal(savedProgress.posts['1'].status,'complete');
+ const original=disk.valid.bind(disk);disk.valid=()=>{throw Error('Unchanged files must not be scanned');};assert.equal((await run()).skipped,2);assert.equal(infos,2);disk.valid=original;
+ p2.updatedDatetime='2026-11-04T00:00:00Z';assert.equal((await run()).saved,1);assert.equal(infos,3);assert.equal(c.downloads,3);
+ items.push(post('3'));const response=c.response;c.response=async()=>{throw new AppError('HTTP 404');};assert.equal((await run()).errors,1);
+ assert.equal((await disk.json(progressPath('sample'))).posts['3'].status,'error');c.response=response;assert.equal((await run()).saved,1);assert.equal(infos,5);
+});
+
+test('incremental first run adopts legacy completion records, while changed filters include old posts',async()=>{
+ const items=[post('1'),post('2',{feeRequired:300})],c=fakeClient(items),disk=new Disk(new MemoryDirectory());await new Downloader(c,disk).run([rule({mode:'exact'})]);let infos=0;const api=c.api;c.api=async p=>{infos++;return api.call(c,p);};
+ const opts={incremental:true,onlyUnfinished:true,trackProgress:true};const first=await new Downloader(c,disk,()=>{},opts).run([rule({mode:'exact'})]);assert.equal(first.skipped,1);assert.equal(infos,0);
+ const expanded=await new Downloader(c,disk,()=>{},opts).run([rule()]);assert.equal(expanded.saved,1);assert.equal(infos,1);
+});
+
+test('interruption and listing failure never advance a creator checkpoint; preview is read-only',async()=>{
+ const c=fakeClient(),disk=new Disk(new MemoryDirectory()),opts={incremental:true,onlyUnfinished:true,trackProgress:true};await new Downloader(c,disk,()=>{},opts).run([rule()]);const before=await disk.json(progressPath('sample'));
+ c.posts=async function*(){yield post('1');throw new AppError('list failed');};await new Downloader(c,disk,()=>{},opts).run([rule()]);assert.deepEqual(await disk.json(progressPath('sample')),before);
+ c.posts=async function*(){yield post('1');throw new DOMException('stop','AbortError');};await assert.rejects(()=>new Downloader(c,disk,()=>{},opts).run([rule()]),{name:'AbortError'});assert.deepEqual(await disk.json(progressPath('sample')),before);
+ c.posts=async function*(){yield post('2');};await new Downloader(c,disk,()=>{},opts).run([rule()],true);assert.deepEqual(await disk.json(progressPath('sample')),before);assert.equal(c.downloads,1);
+});
+
+test('blocked DLL ZIPs are saved as Windows jobs without download failure and clear prior failure hooks',async()=>{
+ const disk=new Disk(new MemoryDirectory()),c=fakeClient([post('7',{body:{files:[{url:'https://downloads.fanbox.cc/app.zip',extension:'zip'}]}})],await archive([['Runtime/plugin.dll','library']])),jobs=[],successes=[];
+ const handle=disk.handle.bind(disk);disk.handle=async(parts,create=true)=>{if(create&&parts.at(-1).endsWith('.dll'))throw new TypeError('blocked');return handle(parts,create);};
+ const result=await new Downloader(c,disk,()=>{},{onManualZip:({job})=>jobs.push(job),onSuccess:({item})=>successes.push(item.id)}).run([rule()]);
+ assert.equal(result.errors,0);assert.equal(result.manual,1);assert.equal(result.saved,1);assert.equal(jobs.length,1);assert.deepEqual(successes,['7']);
+ const job=await disk.json(['.fanbox-state','windows-unzip',jobs[0].id+'.json']);assert.equal(job.size,(await disk.file(job.archive)).size);assert.equal(job.postId,'7');assert(await disk.json(['.fanbox-state','sample','7.json']));
 });

@@ -293,8 +293,12 @@ function zipFailure(error, archive, entry, phase) {
   else reason='この段階で展開に失敗しました。元ZIPをWindowsでも展開できるか確認してください。';
   const result=new AppError(`${context}：${reason}［${phase}／${code}］ 元ZIPは保存先に残しています。`);
   result.invalidArchive=Boolean(known&&/INVALID_CRC32|INVALID_COMPRESSED_DATA|INVALID_UNCOMPRESSED_SIZE|BAD_FORMAT|EOCDR|CENTRAL_DIRECTORY_NOT_FOUND|LOCAL_FILE_HEADER_NOT_FOUND/.test(known));
+  result.manualExtraction=Boolean((phase==='ファイル作成'&&/\.(dll|exe|msi|cmd|bat|ps1|vbs|lnk|scf|url|ini)$/i.test(entry?.filename||'')&&['TypeError','NotAllowedError','SecurityError'].includes(error?.name))||known==='ERR_UNSUPPORTED_COMPRESSION');
   return result;
 }
+
+export const scanPolicy=rule=>JSON.stringify({amount:rule.amount,mode:rule.mode,includeFree:rule.includeFree,supportedFee:rule.supportedFee});
+export const progressPath=id=>['.fanbox-state',safeName(id),'.progress-v1'];
 
 export async function unzip(disk, archive, destination, prefix, grouped, signal) {
   const zip = globalThis.zip;
@@ -331,7 +335,7 @@ export function userError(e) {
 }
 
 export class Downloader {
-  constructor(client, disk, log = () => {}, options = {}) { this.client = client; this.disk = disk; this.log = log; this.signal = client.signal; this.options=options;this.onExisting = options.onExisting || (async () => ({action:'skip'})); this.existingAction = null; this.count = {saved: 0, skipped: 0, filtered: 0, restricted: 0, errors: 0}; }
+  constructor(client, disk, log = () => {}, options = {}) { this.client = client; this.disk = disk; this.log = log; this.signal = client.signal; this.options=options;this.onExisting = options.onExisting || (async () => ({action:'skip'})); this.existingAction = null; this.count = {saved: 0, skipped: 0, filtered: 0, restricted: 0, errors: 0, manual:0}; }
   async notify(name,value) {
     try{await this.options[name]?.(value);}
     catch{this.log('失敗履歴の保存に失敗しました。このタブを閉じる前にログを保存してください。');}
@@ -351,15 +355,18 @@ export class Downloader {
     const statePath = ['.fanbox-state', safeName(rule.id), safeName(item.id) + '.json'];
     const policy = JSON.stringify({grouped: rule.grouped, folder, version: 2});
     const old = await this.disk.json(statePath);
-    if(this.options.onlyUnfinished && old?.files?.length && await this.disk.valid(old.files,this.signal)) {
+    if(this.options.onlyUnfinished && (!this.options.incremental||(item.updatedDatetime&&old?.updated===item.updatedDatetime)) && old?.files?.length && await this.disk.valid(old.files,this.signal)) {
       this.count.skipped++;this.log(`保存完了を確認・スキップ：${item.id}`);
-      await this.notify('onSuccess',{rule,item});return;
+      await this.notify('onSuccess',{rule,item});return 'complete';
     }
     const existing = old?.files?.length && await this.disk.existsAny(old.files, this.signal);
-    if(!this.options.onlyUnfinished && existing && !await this.confirmExisting(rule,item,old.policy !== policy || old.base !== baseName(rule,item))) return;
+    if(!this.options.onlyUnfinished && existing && !await this.confirmExisting(rule,item,old.policy !== policy || old.base !== baseName(rule,item))) return 'skipped';
     const post = await this.client.api('post.info?' + new URLSearchParams({postId: item.id}));
     if (post?.isRestricted || post?.body == null) { this.count.restricted++; this.log(`閲覧不可：${item.id}`); return; }
     if (!feeMatches(Number(post.feeRequired || 0), rule)) { this.count.filtered++; return; }
+    if(this.options.incremental&&post.updatedDatetime&&old?.updated===post.updatedDatetime&&old?.files?.length&&await this.disk.valid(old.files,this.signal)){
+      this.count.skipped++;await this.notify('onSuccess',{rule,item});return 'complete';
+    }
     const base = baseName(rule, post), destination = rule.grouped ? [folder, base] : [folder], records = [];
     const assets = collectAssets(post);
     const revision=post.updatedDatetime??item.updatedDatetime;
@@ -373,7 +380,7 @@ export class Downloader {
       return {...asset,prefix,parts};
     });
     if(!this.options.onlyUnfinished && !existing && await this.disk.existsAny([...targets.map(a=>({parts:a.parts})),{parts:[...destination,`${base}_本文.txt`]}],this.signal)) {
-      if(!await this.confirmExisting(rule,post,false)) return;
+      if(!await this.confirmExisting(rule,post,false)) return 'skipped';
     }
     for (const asset of targets) {
       checkStop(this.signal);
@@ -395,6 +402,12 @@ export class Downloader {
         this.log(`ZIP展開中：${parts.at(-1)}`);
         try{records.push(...await unzip(this.disk, parts, destination, prefix, rule.grouped, this.signal));}
         catch(error){
+          if(error.manualExtraction){
+            const jobKey=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(record)))),b=>b.toString(16).padStart(2,'0')).join('');
+            const job={version:1,id:jobKey,creatorId:rule.id,creatorName:rule.name,postId:String(item.id),archive:record.parts,size:record.size,modified:record.modified,reason:error.message,createdAt:new Date().toISOString()};
+            await this.disk.write(['.fanbox-state','windows-unzip',jobKey+'.json'],JSON.stringify(job),this.signal);
+            this.count.manual++;this.log(`Windowsでの展開待ち：${parts.at(-1)}`);await this.notify('onManualZip',{job});continue;
+          }
           if(error.invalidArchive){delete receipt.files[prefix];await this.disk.write(receiptPath,JSON.stringify(receipt),this.signal);}
           throw error;
         }
@@ -405,6 +418,7 @@ export class Downloader {
     this.count.saved++;
     this.log(`投稿保存完了：${base}`);
     await this.notify('onSuccess',{rule,item});
+    return 'saved';
   }
   async run(rules, preview = false) {
     this.existingAction=null;
@@ -412,22 +426,34 @@ export class Downloader {
       if(this.options.retryFilter && !this.options.retryFilter.has(rule.id))continue;
       checkStop(this.signal);
       this.log(rule.supportedFee===0?`クリエイター：${rule.name} ／ 無料投稿のみ`:`支援先：${rule.name} ／ ${rule.supportedFee}円で支援`);
+      const tracking=!preview&&this.options.trackProgress;
+      const progress={version:1,checkedAt:new Date().toISOString(),policy:scanPolicy(rule),posts:{},latestPostId:null,latestPublished:null};
       try {
+        const previous=this.options.incremental?await this.disk.json(progressPath(rule.id)):null;
+        const usable=previous?.policy===scanPolicy(rule)?previous:null;
         for await (const item of this.client.posts(rule.id)) {
           checkStop(this.signal);
+          const revision=typeof item.updatedDatetime==='string'?item.updatedDatetime:null;
+          const entry={updated:revision,status:'pending'};progress.posts[String(item.id)]=entry;
+          if(item.publishedDatetime&&(!progress.latestPublished||Date.parse(item.publishedDatetime)>Date.parse(progress.latestPublished))){progress.latestPublished=item.publishedDatetime;progress.latestPostId=String(item.id);}
           const targets=this.options.retryFilter?.get(rule.id);
           if(targets && !targets.has(String(item.id)))continue;
-          if (!feeMatches(Number(item.feeRequired || 0), rule)) { this.count.filtered++; continue; }
-          if (item.isRestricted) { this.count.restricted++; continue; }
+          if (!feeMatches(Number(item.feeRequired || 0), rule)) { entry.status='filtered';this.count.filtered++; continue; }
+          if (item.isRestricted) { entry.status='restricted';this.count.restricted++; continue; }
+          if(this.options.incremental&&revision&&usable?.posts?.[item.id]?.updated===revision&&usable.posts[item.id].status==='complete'){
+            entry.status='complete';this.count.skipped++;continue;
+          }
           if (preview) { this.count.saved++; this.log(`対象候補：${item.id} ／ ${item.title || ''} ／ ${item.feeRequired}円`); continue; }
-          try { await this.save(rule, item); }
-          catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`投稿 ${item.id}：${userError(error)}`);await this.notify('onFailure',{rule,item,error:userError(error)}); }
+          try { const result=await this.save(rule, item);entry.status=['saved','complete'].includes(result)?'complete':'pending'; }
+          catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal);entry.status='error'; this.count.errors++; this.log(`投稿 ${item.id}：${userError(error)}`);await this.notify('onFailure',{rule,item,error:userError(error)}); }
         }
+        checkStop(this.signal);
+        if(tracking){await this.disk.write(progressPath(rule.id),JSON.stringify(progress),this.signal);await this.notify('onProgress',{rule,progress});}
         if(!preview)await this.notify('onCreatorSuccess',{rule});
       } catch (error) { if(error.name==='AbortError')throw error;checkStop(this.signal); this.count.errors++; this.log(`${rule.name}：${userError(error)}`);if(!preview)await this.notify('onFailure',{rule,item:null,error:userError(error)}); }
     }
     const c = this.count;
-    this.log(`終了：${preview ? '候補' : '保存'} ${c.saved} ／ 保存済み ${c.skipped} ／ 金額対象外 ${c.filtered} ／ 閲覧不可 ${c.restricted} ／ 失敗 ${c.errors}`);
+    this.log(`終了：${preview ? '候補' : '保存'} ${c.saved} ／ 保存済み ${c.skipped} ／ 金額対象外 ${c.filtered} ／ 閲覧不可 ${c.restricted} ／ 失敗 ${c.errors} ／ Windows展開待ち ${c.manual}`);
     return c;
   }
 }

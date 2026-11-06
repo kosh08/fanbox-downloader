@@ -1,9 +1,10 @@
-import {AppError, Client, Disk, Downloader, userError, failureIdsFromLog, creatorRules, creatorIdFromInput} from './core.mjs';
+import {AppError, Client, Disk, Downloader, userError, failureIdsFromLog, creatorRules, creatorIdFromInput,progressPath} from './core.mjs';
 import {githubPackage, zipPackage, applyPackage, validateFolder, sha256} from './update.mjs';
 
 const $ = id => document.getElementById(id);
 let rules = [], storedRules = {}, rootHandle = null, updateHandle = null, busy = false, controller;
 let failureStores=[],failureStore=null;
+let progressMap={};
 const RULE_ID = 73001;
 const showError = e => log(userError(e));
 
@@ -61,6 +62,32 @@ function node(tag, text, className) {
   return el;
 }
 
+async function refreshProgress(){
+  progressMap={};
+  if(!rootHandle||await rootHandle.queryPermission({mode:'readwrite'})!=='granted')return;
+  const disk=new Disk(rootHandle);
+  for(const rule of rules)progressMap[rule.id]=await disk.json(progressPath(rule.id));
+}
+async function refreshWindows(){
+  const list=$('windows-list');list.replaceChildren();let pending=0,done=0,errors=0;
+  if(rootHandle&&await rootHandle.queryPermission({mode:'readwrite'})==='granted'){
+    try{
+      const dir=await(await rootHandle.getDirectoryHandle('.fanbox-state')).getDirectoryHandle('windows-unzip');
+      for await(const [name,handle]of dir.entries()){
+        if(!/^[a-f0-9]{64}\.json$/.test(name))continue;
+        const job=JSON.parse(await(await handle.getFile()).text());if(!Array.isArray(job.archive))continue;
+        let result=null;try{result=JSON.parse(await(await(await dir.getFileHandle(job.id+'.result.json')).getFile()).text());}catch(e){if(e.name!=='NotFoundError')throw e;}
+        const label=result?.status==='done'?'展開済み':result?.status==='error'?'Windows側で要確認':result?.status==='exists'?'展開先あり（要確認）':'Windowsでの展開待ち';
+        if(result?.status==='done')done++;else if(result)errors++;else pending++;
+        if(list.childElementCount<200){const row=node('div',`${label}：${job.archive.at(-1)}`);row.title=result?.message||job.reason||'';list.append(row);}
+      }
+    }catch(e){if(e.name!=='NotFoundError')throw e;}
+  }
+  $('windows-count').textContent=`待ち ${pending} ／ 展開済み ${done} ／ 要確認 ${errors}`;
+}
+$('refresh-windows').addEventListener('click',()=>refreshWindows().catch(showError));
+$('download-mode').addEventListener('change',()=>chrome.storage.local.set({scanMode:$('download-mode').value}).catch(showError));
+
 function render() {
   $('creators').replaceChildren();
   $('empty').hidden = rules.length > 0;
@@ -76,6 +103,9 @@ function render() {
     }
     cell().append(checkbox('enabled'));
     const name = cell(); name.append(node('strong', rule.name), node('small', '@' + rule.id));
+    const progress=progressMap[rule.id];
+    name.append(node('small',progress?.checkedAt?`最終確認：${new Intl.DateTimeFormat('ja-JP',{dateStyle:'short',timeStyle:'short',timeZone:'Asia/Tokyo'}).format(new Date(progress.checkedAt))}`:'最終確認：未記録','creator-progress'));
+    if(progress?.latestPostId)name.append(node('small',`最新確認：投稿 ${progress.latestPostId} ／ ${new Date(progress.latestPublished).toLocaleDateString('ja-JP',{timeZone:'Asia/Tokyo'})}`,'creator-progress'));
     if(rule.manual){
       name.append(node('small','個別追加','manual-tag'));
       const remove=node('button','一覧から外す','remove-creator secondary');remove.type='button';remove.setAttribute('aria-label',`${rule.name}：個別追加を解除`);
@@ -174,6 +204,7 @@ $('folder').addEventListener('click', async () => {
     await storeHandle(rootHandle); await folderStatus();
     failureStores=await loadHandle('failure-stores')||[];
     await selectFailureStore();
+    await refreshProgress();render();await refreshWindows();
   } catch (e) { if (e.name !== 'AbortError') showError(e); }
 });
 
@@ -181,6 +212,7 @@ $('connect').addEventListener('click', () => task(async client => {
   log('現在の支援先と支援額を確認中…');
   const active = await client.supporting();
   rules = creatorRules(active,storedRules);
+  await refreshProgress();
   render(); await saveRules();
   $('connection').textContent = `ログイン確認済み・支援先 ${active.length} 件 ／ 保存対象 ${rules.length} 件`;
   log(`保存対象を${rules.length}件読み込みました（個別追加を含む）。`);
@@ -196,10 +228,10 @@ $('add-creator').addEventListener('click',()=>task(async client=>{
 }));
 $('creator-input').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();if(!busy)$('add-creator').click();}});
 
-async function start(preview,mode='normal') {
+async function start(preview,mode=$('download-mode').value) {
   if (busy) return;
   if (!rules.some(r => r.enabled)) { log('支援先を読み込むか個別追加し、取得するクリエイターを選んでください。'); return; }
-  if (!preview) {
+  if (!preview||mode==='incremental') {
     if (!rootHandle) { log('保存先フォルダを選んでください。'); return; }
     try { if (await rootHandle.requestPermission({mode: 'readwrite'}) !== 'granted') { log('保存先へのアクセスを許可してください。'); return; } }
     catch (e) { showError(e); return; }
@@ -235,9 +267,11 @@ async function start(preview,mode='normal') {
         }
         if(!retryFilter.size){log('再試行できる投稿がありません。支援先の選択と失敗履歴を確認してください。');return;}
       }
-      log(mode==='unfinished'?'完了済み投稿は確認してスキップし、未完了・未取得分だけを保存します。':mode==='failed'?'記録された失敗分だけを再試行します。':'投稿の取得を開始します。');
-      await new Downloader(client, preview ? null : new Disk(rootHandle), log, {onExisting: askExisting,onlyUnfinished:mode!=='normal',retryFilter,
+      log(mode==='incremental'?'更新分を確認します。初回は既存の保存記録を引き継ぎます。':mode==='unfinished'?'完了済み投稿は確認してスキップし、未完了・未取得分だけを保存します。':mode==='failed'?'記録された失敗分だけを再試行します。':'全件を確認して保存します。');
+      await new Downloader(client, preview&&mode!=='incremental' ? null : new Disk(rootHandle), log, {onExisting: askExisting,onlyUnfinished:mode!=='normal',retryFilter,incremental:mode==='incremental',trackProgress:['normal','incremental'].includes(mode),
+        onProgress:async({rule,progress})=>{progressMap[rule.id]=progress;render();},onManualZip:()=>refreshWindows(),
         onFailure:recordFailure,onSuccess:clearFailure,onCreatorSuccess:async({rule})=>{delete failureStore.items[`${rule.id}/*`];await persistFailures();}}).run(verified, preview);
+      await refreshWindows();
     });
   });
 }
@@ -345,9 +379,11 @@ async function init() {
   state(true);
   try {
     storedRules = (await chrome.storage.local.get('rules')).rules || {};
+    $('download-mode').value=(await chrome.storage.local.get('scanMode')).scanMode==='normal'?'normal':'incremental';
     rules=creatorRules([],storedRules);render();
     rootHandle = await loadHandle(); await folderStatus();
     failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
+    await refreshProgress();render();await refreshWindows();
     updateHandle=await loadHandle('update-folder');
     showUpdateSetup();
     $('installed-version').textContent='v'+chrome.runtime.getManifest().version;
@@ -356,3 +392,4 @@ async function init() {
   finally { state(false); }
 }
 init();
+setInterval(()=>{if(!busy&&!document.hidden)refreshWindows().catch(()=>{});},15000);

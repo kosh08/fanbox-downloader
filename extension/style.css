@@ -7,3 +7,7 @@
 .manual-add{margin-top:18px;padding:16px;background:var(--light);border-radius:9px}.manual-add>label{display:block;font-weight:650;font-size:12px;margin-bottom:8px}#creator-input{flex:1;min-width:180px;max-width:560px;border:1px solid #ced8ce;border-radius:6px;padding:11px;font:inherit;background:white}.remove-creator{display:block;font-size:10px;padding:4px 8px;margin-top:6px}
 
 .manual-tag{margin-left:6px;color:var(--green);font-weight:600}
+
+#download-mode{padding:10px;border:1px solid #ced8ce;border-radius:6px;background:white;color:var(--ink)}#windows-list{max-height:220px;overflow:auto;overflow-wrap:anywhere;font-size:11px;margin-top:12px}#windows-list>div{padding:5px 0;border-bottom:1px solid var(--line)}
+
+td .creator-progress{display:block;white-space:normal;max-width:300px;font-size:10px;margin-top:3px}
