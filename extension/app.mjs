@@ -364,25 +364,31 @@ function showUpdateSetup() {
 async function chooseUpdateFolder(){
   try {
     const handle=await showDirectoryPicker({id:'fanbox-extension-update',mode:'readwrite'});
-    await validateFolder(handle,chrome.runtime.getManifest());
-    updateHandle=handle;await storeHandle(handle,'update-folder');showUpdateSetup();
+    $('update-status').textContent='選んだ拡張機能フォルダを確認中…';
+    await withDeadline(validateFolder(handle,chrome.runtime.getManifest()), '更新先フォルダの確認');
+    updateHandle=handle;
+    showUpdateSetup();
+    withDeadline(storeHandle(handle,'update-folder'), '更新先の記録').catch(error => {
+      log(userError(error) + ' このタブでは選んだフォルダを使えます。');
+    });
     $('update-status').textContent='設定できました。次回から「最新版に更新」だけで更新できます。';
     return true;
-  }catch(e){if(e.name!=='AbortError')showError(e);return false;}
+  }catch(e){$('update-status').textContent=e.name==='AbortError'?'更新先の選択をキャンセルしました。':userError(e);return false;}
 }
 $('update-folder').addEventListener('click',()=>chooseUpdateFolder());
 
 async function updateTool(source) {
   if(busy)return;
+  $('update-status').textContent=updateHandle?'更新先のアクセスを確認中…':'読み込み済みの拡張機能フォルダを選んでください。';
   if(!updateHandle){if(!await chooseUpdateFolder())return;if(source==='zip')return;}
   let file;
   try {
-    if(await updateHandle.requestPermission({mode:'readwrite'})!=='granted')throw new AppError('更新先の読み書きを許可してください。');
+    if(await withDeadline(updateHandle.requestPermission({mode:'readwrite'}), '更新先へのアクセス確認')!=='granted')throw new AppError('更新先の読み書きを許可してください。');
     if(source==='zip') {
       const [handle]=await showOpenFilePicker({types:[{description:'更新ZIP',accept:{'application/zip':['.zip']}}],multiple:false});
       file=await handle.getFile();
     }
-  }catch(e){if(e.name!=='AbortError')showError(e);return;}
+  }catch(e){$('update-status').textContent=e.name==='AbortError'?'更新をキャンセルしました。':userError(e);return;}
   state(true);$('stop').disabled=true;
   try {
     await navigator.locks.request('fanbox-archive-run',{ifAvailable:true},async lock=>{
