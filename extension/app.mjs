@@ -17,6 +17,20 @@ function log(text) {
   $('log').scrollTop = $('log').scrollHeight;
 }
 
+async function withDeadline(operation, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new AppError(label + 'に時間がかかりすぎています。管理画面を開き直してください。')), 5000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function state(value) {
   busy = value;
   for (const element of document.querySelectorAll('button,input,select')) element.disabled = value;
@@ -27,7 +41,7 @@ function state(value) {
 
 async function saveRules() {
   storedRules = {...storedRules, ...Object.fromEntries(rules.map(r => [r.id, r]))};
-  await chrome.storage.local.set({rules: storedRules});
+  await withDeadline(chrome.storage.local.set({rules: storedRules}), '保存設定の書き込み');
 }
 
 function showFailures(){
@@ -40,19 +54,27 @@ function showFailures(){
 async function selectFailureStore(){
   failureStore=null;
   if(rootHandle){
-    for(const archive of failureStores){try{if(await archive.handle.isSameEntry(rootHandle)){failureStore=archive;break;}}catch{}}
+    for (const archive of failureStores) {
+      if (await withDeadline(archive.handle.isSameEntry(rootHandle), '失敗履歴と保存先の照合')) {
+        failureStore = archive;
+        break;
+      }
+    }
     if(!failureStore){failureStore={handle:rootHandle,items:{}};failureStores.push(failureStore);}
   }
   showFailures();
 }
-async function persistFailures(){showFailures();await storeHandle(failureStores,'failure-stores');}
+async function persistFailures(){showFailures();await withDeadline(storeHandle(failureStores,'failure-stores'), '失敗履歴の書き込み');}
 async function recordFailure({rule,item,error}){
   const key=`${rule.id}/${item?.id||'*'}`;
   failureStore.items[key]={creatorId:rule.id,creatorName:rule.name,postId:item?String(item.id):null,title:item?.title||'',error,at:new Date().toISOString()};
   await persistFailures();
 }
 async function clearFailure({rule,item}){
-  delete failureStore.items[`${rule.id}/${item.id}`];delete failureStore.items[`?/${item.id}`];await persistFailures();
+  const keys = [`${rule.id}/${item.id}`, `?/${item.id}`];
+  if (!keys.some(key => Object.hasOwn(failureStore.items, key))) return;
+  for (const key of keys) delete failureStore.items[key];
+  await persistFailures();
 }
 
 function node(tag, text, className) {
@@ -193,7 +215,7 @@ async function folderStatus() {
 async function task(fn) {
   if (busy) return;
   state(true); controller = new AbortController();
-  try { await ensureHeaders(); await fn(new Client(controller.signal)); }
+  try { await withDeadline(ensureHeaders(), 'Chromeの通信設定'); await fn(new Client(controller.signal)); }
   catch (e) { showError(e); }
   finally { state(false); }
 }
@@ -215,6 +237,10 @@ $('connect').addEventListener('click', () => task(async client => {
   render(); await saveRules();
   $('connection').textContent = `ログイン確認済み・支援先 ${active.length} 件 ／ 保存対象 ${rules.length} 件`;
   log(`保存対象を${rules.length}件読み込みました（個別追加を含む）。`);
+  const loadedRules = rules;
+  refreshProgress().then(() => {
+    if (!busy && rules === loadedRules) render();
+  }).catch(showError);
 }));
 
 $('add-creator').addEventListener('click',()=>task(async client=>{
@@ -238,8 +264,17 @@ async function start(preview,mode=$('download-mode').value) {
   await task(async client => {
     await navigator.locks.request('fanbox-archive-run', {ifAvailable: true}, async lock => {
       if (!lock) throw new AppError('別の管理画面で処理中です。そちらの完了を待ってください。');
-      failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
-      await saveRules();
+      log('保存の準備中：失敗履歴を確認しています…');
+      try {
+        failureStores = await withDeadline(loadHandle('failure-stores'), '失敗履歴の読み込み') || [];
+        await selectFailureStore();
+      } catch (error) {
+        failureStore = null;
+        showFailures();
+        if (mode === 'failed') throw error;
+        log('以前の失敗履歴を開けませんでした。作品フォルダの保存記録を使って続けます。');
+      }
+      client.signal.throwIfAborted();
       log(preview ? '保存せずに投稿候補を確認します…' : '現在の支援状況を確認して保存を開始します…');
       const active = new Map((await client.supporting()).map(r => [r.id, r]));
       const verified = [];
@@ -268,9 +303,9 @@ async function start(preview,mode=$('download-mode').value) {
       }
       log(mode==='incremental'?'更新分を確認します。初回は既存の保存記録を引き継ぎます。':mode==='unfinished'?'完了済み投稿は確認してスキップし、未完了・未取得分だけを保存します。':mode==='failed'?'記録された失敗分だけを再試行します。':'全件を確認して保存します。');
       await new Downloader(client, preview&&mode!=='incremental' ? null : new Disk(rootHandle), log, {onExisting: askExisting,onlyUnfinished:mode!=='normal',retryFilter,incremental:mode==='incremental',trackProgress:['normal','incremental'].includes(mode),
-        onProgress:async({rule,progress})=>{progressMap[rule.id]=progress;render();},onManualZip:()=>refreshWindows(),
-        onFailure:recordFailure,onSuccess:clearFailure,onCreatorSuccess:async({rule})=>{delete failureStore.items[`${rule.id}/*`];await persistFailures();}}).run(verified, preview);
-      await refreshWindows();
+        onProgress:async({rule,progress})=>{progressMap[rule.id]=progress;render();},onManualZip:()=>{refreshWindows().catch(showError);},
+        onFailure:failureStore ? recordFailure : undefined,onSuccess:failureStore ? clearFailure : undefined,onCreatorSuccess:async({rule})=>{if(failureStore?.items[`${rule.id}/*`]){delete failureStore.items[`${rule.id}/*`];await persistFailures();}}}).run(verified, preview);
+      refreshWindows().catch(showError);
     });
   });
 }
@@ -377,20 +412,33 @@ window.addEventListener('beforeunload', event => { if (busy) { event.preventDefa
 async function init() {
   state(true);
   try {
-    storedRules = (await chrome.storage.local.get('rules')).rules || {};
-    $('download-mode').value=(await chrome.storage.local.get('scanMode')).scanMode==='normal'?'normal':'incremental';
-    rules=creatorRules([],storedRules);render();
-    rootHandle = await loadHandle();
-    failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
-    updateHandle=await loadHandle('update-folder');
-    showUpdateSetup();
     $('installed-version').textContent='v'+chrome.runtime.getManifest().version;
+    const [settings, folder, failures, update] = await Promise.allSettled([
+      withDeadline(chrome.storage.local.get(['rules', 'scanMode']), 'Chromeの設定読み込み'),
+      withDeadline(loadHandle(), '作品保存先の読み込み'),
+      withDeadline(loadHandle('failure-stores'), '失敗履歴の読み込み'),
+      withDeadline(loadHandle('update-folder'), '更新先の読み込み'),
+    ]);
+    if (settings.status === 'fulfilled') {
+      storedRules = settings.value.rules || {};
+      $('download-mode').value = settings.value.scanMode === 'normal' ? 'normal' : 'incremental';
+    }
+    if (folder.status === 'fulfilled') rootHandle = folder.value;
+    if (failures.status === 'fulfilled') failureStores = failures.value || [];
+    if (update.status === 'fulfilled') updateHandle = update.value;
+    showUpdateSetup();
+    rules = creatorRules([], storedRules);
+    render();
+    for (const result of [settings, folder, failures, update]) {
+      if (result.status === 'rejected') showError(result.reason);
+    }
     if (!window.showDirectoryPicker) throw new AppError('このChromeでは保存先の選択を利用できません。パソコン版Chromeを更新してください。');
   } catch (e) { showError(e); }
   finally { state(false); }
 }
 init().then(async () => {
   const folder = rootHandle;
+  selectFailureStore().catch(showError);
   await folderStatus();
   await refreshProgress();
   if (!busy && rootHandle === folder) render();
