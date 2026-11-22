@@ -212,7 +212,6 @@ $('connect').addEventListener('click', () => task(async client => {
   log('現在の支援先と支援額を確認中…');
   const active = await client.supporting();
   rules = creatorRules(active,storedRules);
-  await refreshProgress();
   render(); await saveRules();
   $('connection').textContent = `ログイン確認済み・支援先 ${active.length} 件 ／ 保存対象 ${rules.length} 件`;
   log(`保存対象を${rules.length}件読み込みました（個別追加を含む）。`);
@@ -381,9 +380,8 @@ async function init() {
     storedRules = (await chrome.storage.local.get('rules')).rules || {};
     $('download-mode').value=(await chrome.storage.local.get('scanMode')).scanMode==='normal'?'normal':'incremental';
     rules=creatorRules([],storedRules);render();
-    rootHandle = await loadHandle(); await folderStatus();
+    rootHandle = await loadHandle();
     failureStores=await loadHandle('failure-stores')||[];await selectFailureStore();
-    await refreshProgress();render();await refreshWindows();
     updateHandle=await loadHandle('update-folder');
     showUpdateSetup();
     $('installed-version').textContent='v'+chrome.runtime.getManifest().version;
@@ -391,5 +389,11 @@ async function init() {
   } catch (e) { showError(e); }
   finally { state(false); }
 }
-init();
+init().then(async () => {
+  const folder = rootHandle;
+  await folderStatus();
+  await refreshProgress();
+  if (!busy && rootHandle === folder) render();
+  await refreshWindows();
+}).catch(showError);
 setInterval(()=>{if(!busy&&!document.hidden)refreshWindows().catch(()=>{});},15000);
