@@ -51,16 +51,31 @@ function showFailures(){
   $('failure-list').replaceChildren();
   for(const entry of entries.slice(-200))$('failure-list').append(node('div',`${entry.creatorName||'支援先未確認'} ／ ${entry.postId?'投稿 '+entry.postId+' '+(entry.title||''):'一覧の取得'}：${entry.error}`));
 }
-async function selectFailureStore(){
-  failureStore=null;
-  if(rootHandle){
-    for (const archive of failureStores) {
-      if (await withDeadline(archive.handle.isSameEntry(rootHandle), '失敗履歴と保存先の照合')) {
-        failureStore = archive;
-        break;
-      }
-    }
-    if(!failureStore){failureStore={handle:rootHandle,items:{}};failureStores.push(failureStore);}
+async function selectFailureStore() {
+  const folder = rootHandle;
+  const archives = failureStores;
+  failureStore = null;
+  if (folder) {
+    // Either API can establish identity. A name alone cannot.
+    const compare = archive => Promise.any([
+      archive.handle.isSameEntry(folder),
+      folder.resolve(archive.handle).then(path => {
+        if (Array.isArray(path) && path.length === 0) return true;
+        throw new Error('Folder identity was not established');
+      }),
+    ]);
+    const comparisons = archives.map(compare);
+    const firstMatch = Promise.any(comparisons.map(async (comparison, index) => {
+      if (await comparison) return archives[index];
+      throw new Error('Different folder');
+    })).catch(async () => {
+      await Promise.all(comparisons);
+      return null;
+    });
+    const match = await withDeadline(firstMatch, '失敗履歴と保存先の照合');
+    if (rootHandle !== folder || failureStores !== archives) return;
+    failureStore = match || {handle: folder, items: {}};
+    if (!archives.includes(failureStore)) archives.push(failureStore);
   }
   showFailures();
 }
